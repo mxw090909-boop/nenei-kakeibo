@@ -1,0 +1,1278 @@
+import { useState, useEffect, useMemo } from "react";
+import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
+import Papa from "papaparse";
+import _ from "lodash";
+
+/* ═══════════════════════════════════════════
+   1. CONSTANTS
+   ═══════════════════════════════════════════ */
+
+const CATS = {
+  food:    { name:"吃喝", icon:"🍜", color:"#e8985a", subs:["外食","コンビニ","スーパー","カフェ","デリバリー"] },
+  transit: { name:"交通", icon:"🚃", color:"#6aabcf", subs:["電車・バス","タクシー","自転車","飛行機"] },
+  housing: { name:"住居", icon:"🏠", color:"#7dab7d", subs:["家賃","光熱費","通信費","家具・家電"] },
+  daily:   { name:"日用品", icon:"🧴", color:"#c9a84c", subs:["消耗品","洗濯・掃除","キッチン"] },
+  medical: { name:"医疗", icon:"💊", color:"#d48ba6", subs:["病院","薬局","健康診断"] },
+  travel:  { name:"旅行", icon:"✈️", color:"#5aafa8", subs:["宿泊","交通費","食費","アクティビティ","お土産"] },
+  fashion: { name:"服饰美容", icon:"👗", color:"#a494c8", subs:["衣服","靴・バッグ","美容院","コスメ"] },
+  fun:     { name:"娱乐", icon:"🎮", color:"#cf7563", subs:["書籍","映画・音楽","ゲーム","趣味"] },
+  social:  { name:"社交", icon:"🥂", color:"#c47a82", subs:["飲み会","プレゼント","冠婚葬祭"] },
+  admin:   { name:"行政", icon:"📋", color:"#8a95a3", subs:["税金","保険","手数料","ビザ・在留"] },
+  other:   { name:"其他", icon:"📦", color:"#a39b91", subs:["未分類","雑費","ATM手数料"] },
+};
+const CAT_KEYS = Object.keys(CATS);
+const PM_LIST = ["Olive","EPOS","PayPay","現金"];
+const PM_COLORS = { Olive:"#4a9c6d", EPOS:"#7c5cbf", PayPay:"#e44e4e", "現金":"#c9a84c" };
+const THEME_PRESETS = ["#d4736b", "#4a9c6d", "#6aabcf", "#7c5cbf", "#5aafa8", "#c9a84c"];
+
+const NON_CONSUME_KW = [
+  "返金","返品","キャンセル","取消","払戻","振込","送金","振替",
+  "チャージ","入金","カード引落","口座引落","ATM","出金","引出",
+  "クレジット支払","還付","ポイント交換"
+];
+
+/* ═══════════════════════════════════════════
+   2. STORAGE ADAPTER
+   ═══════════════════════════════════════════ */
+
+const STORAGE_PREFIX = "nenei-kakeibo:";
+const ASSET_DB_NAME = "nenei-kakeibo-assets";
+const ASSET_STORE = "assets";
+
+const createStorage = () => {
+  const hasWS = typeof window !== "undefined" && window.storage;
+  if (hasWS) return {
+    get: async k => { try { const r = await window.storage.get(k); return r ? JSON.parse(r.value) : null } catch { return null } },
+    set: async (k, v) => { try { await window.storage.set(k, JSON.stringify(v)) } catch(e) { console.error(e) } },
+    del: async k => { try { await window.storage.delete(k) } catch(e) { console.error(e) } },
+  };
+
+  return {
+    get: async k => {
+      try {
+        const raw = window.localStorage.getItem(STORAGE_PREFIX + k);
+        return raw ? JSON.parse(raw) : null;
+      } catch (e) {
+        console.warn("localStorage read failed", e);
+        return null;
+      }
+    },
+    set: async (k, v) => {
+      try { window.localStorage.setItem(STORAGE_PREFIX + k, JSON.stringify(v)); }
+      catch(e) { console.error("localStorage write failed", e); }
+    },
+    del: async k => {
+      try { window.localStorage.removeItem(STORAGE_PREFIX + k); }
+      catch(e) { console.error("localStorage delete failed", e); }
+    },
+  };
+};
+const db = createStorage();
+
+const assetDb = {
+  open: () => new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") { reject(new Error("IndexedDB unavailable")); return; }
+    const req = indexedDB.open(ASSET_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const database = req.result;
+      if (!database.objectStoreNames.contains(ASSET_STORE)) database.createObjectStore(ASSET_STORE, { keyPath:"id" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }),
+  save: async (data, id = `asset_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`) => {
+    const database = await assetDb.open();
+    return new Promise((resolve, reject) => {
+      const tx = database.transaction(ASSET_STORE, "readwrite");
+      tx.objectStore(ASSET_STORE).put({ id, data });
+      tx.oncomplete = () => resolve(id);
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+  get: async id => {
+    const database = await assetDb.open();
+    return new Promise((resolve, reject) => {
+      const req = database.transaction(ASSET_STORE, "readonly").objectStore(ASSET_STORE).get(id);
+      req.onsuccess = () => resolve(req.result?.data || "");
+      req.onerror = () => reject(req.error);
+    });
+  },
+  sync: async (assets = []) => {
+    if (!Array.isArray(assets) || !assets.length) return;
+    await Promise.all(assets.filter(a => a?.id && a?.data).map(a => assetDb.save(a.data, a.id)));
+  }
+};
+
+/* ═══════════════════════════════════════════
+   3. UTILITIES
+   ═══════════════════════════════════════════ */
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+const fmtAmt = n => "¥" + Math.abs(Number(n || 0)).toLocaleString();
+const fmtDate = d => { const [y,m,dd] = String(d || "").split("-"); return m && dd ? `${parseInt(m)}/${parseInt(dd)}` : "-" };
+const fmtMonth = m => { const [y,mo] = String(m || "").split("-"); return `${y}年${parseInt(mo)}月` };
+const today = () => new Date().toISOString().slice(0,10);
+const getMonth = d => String(d || "").slice(0,7);
+const weekday = d => ["日","月","火","水","木","金","土"][new Date(d).getDay()];
+
+const shiftMonth = (m, delta) => {
+  const [y,mo] = m.split("-").map(Number);
+  const dt = new Date(y, mo - 1 + delta, 1);
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}`;
+};
+
+const cleanText = v => String(v ?? "").replace(/^\ufeff/, "").trim();
+
+const hexToRgb = hex => {
+  const raw = String(hex || "").replace("#", "");
+  if (!/^[0-9a-fA-F]{6}$/.test(raw)) return [212, 115, 107];
+  return [parseInt(raw.slice(0,2), 16), parseInt(raw.slice(2,4), 16), parseInt(raw.slice(4,6), 16)];
+};
+
+const isAssetId = value => typeof value === "string" && /^asset_[a-z0-9_]+$/i.test(value);
+
+const readFileAsDataUrl = file => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(String(reader.result || ""));
+  reader.onerror = () => reject(reader.error);
+  reader.readAsDataURL(file);
+});
+
+const highlightText = (text, query) => {
+  const source = String(text || "");
+  const q = cleanText(query);
+  if (!q) return source;
+  const idx = source.toLowerCase().indexOf(q.toLowerCase());
+  if (idx === -1) return source;
+  return (
+    <>
+      {source.slice(0, idx)}
+      <mark className="rounded px-0.5" style={{background:"rgba(var(--accent-rgb),0.2)",color:"var(--accent)"}}>
+        {source.slice(idx, idx + q.length)}
+      </mark>
+      {source.slice(idx + q.length)}
+    </>
+  );
+};
+
+const pick = (row, names) => {
+  for (const name of names) {
+    if (row[name] !== undefined && row[name] !== null && String(row[name]).trim() !== "") return row[name];
+  }
+  return "";
+};
+
+const parseAmount = value => {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const raw = String(value ?? "").trim();
+  if (!raw) return NaN;
+  const normalized = raw
+    .replace(/[￥¥円,，\s]/g, "")
+    .replace(/[▲△]/g, "-")
+    .replace(/^\((.*)\)$/, "-$1");
+  const n = Number(normalized);
+  return Number.isFinite(n) ? n : NaN;
+};
+
+const normalizeDate = value => {
+  let raw = String(value ?? "").trim();
+  if (!raw) return "";
+  raw = raw.replace(/^\ufeff/, "").split(/[ T]/)[0].replace(/[年月.\/]/g, "-").replace(/日$/, "");
+  const digits = raw.replace(/-/g, "");
+
+  let y, m, d;
+  if (/^\d{8}$/.test(digits)) {
+    y = digits.slice(0,4); m = digits.slice(4,6); d = digits.slice(6,8);
+  } else if (/^\d{6}$/.test(digits)) {
+    y = Number(digits.slice(0,2)) >= 70 ? `19${digits.slice(0,2)}` : `20${digits.slice(0,2)}`;
+    m = digits.slice(2,4); d = digits.slice(4,6);
+  } else {
+    const parts = raw.split("-").filter(Boolean);
+    if (parts.length < 3) return "";
+    y = parts[0].length === 2 ? (Number(parts[0]) >= 70 ? `19${parts[0]}` : `20${parts[0]}`) : parts[0];
+    m = parts[1]; d = parts[2];
+  }
+
+  const yy = Number(y), mm = Number(m), dd = Number(d);
+  const dt = new Date(yy, mm - 1, dd);
+  if (dt.getFullYear() !== yy || dt.getMonth() !== mm - 1 || dt.getDate() !== dd) return "";
+  return `${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
+};
+
+const detectTxnType = (merchant, memo, amount) => {
+  const txt = `${merchant} ${memo}`.toLowerCase();
+  if (["返金","返品","キャンセル","取消","払戻","還付"].some(kw => txt.includes(kw.toLowerCase())) || amount < 0) return "refund";
+  if (["チャージ","入金","残高追加"].some(kw => txt.includes(kw.toLowerCase()))) return "charge";
+  if (["振込","送金","振替","カード引落","口座引落","クレジット支払","引落"].some(kw => txt.includes(kw.toLowerCase()))) return "transfer";
+  if (["ATM","出金","引出"].some(kw => txt.includes(kw.toLowerCase()))) return "excluded";
+  return "expense";
+};
+
+const detectNonConsume = (merchant, memo, amount = 0) => detectTxnType(merchant, memo, amount) !== "expense";
+
+const txnKey = t => `${t.date}|${Number(t.amount)}|${cleanText(t.merchant).toLowerCase()}|${t.paymentMethod}`;
+
+const matchRules = (rules, txn) => {
+  const sorted = _.orderBy(rules.filter(r => r.enabled), ["priority"], ["desc"]);
+  for (const r of sorted) {
+    if (r.pmCondition && r.pmCondition !== txn.paymentMethod) continue;
+    const txt = (txn.merchant + " " + (txn.memo||"")).toLowerCase();
+    const kw = cleanText(r.keyword).toLowerCase();
+    if (!kw) continue;
+    if (r.matchType === "exact" ? txt === kw : txt.includes(kw)) return r;
+  }
+  return null;
+};
+
+/* ═══════════════════════════════════════════
+   4. CSV PARSERS
+   ═══════════════════════════════════════════ */
+
+const detectSource = (headers) => {
+  const h = headers.map(s => cleanText(s)).join(",");
+  if (h.includes("PayPay") || h.includes("取引種別") || h.includes("取引日時")) return "PayPay";
+  if (h.includes("EPOS") || h.includes("エポス") || h.includes("ご利用店名")) return "EPOS";
+  return "Olive";
+};
+
+const normalizeRow = (row) => {
+  const out = {};
+  Object.entries(row || {}).forEach(([k, v]) => { out[cleanText(k)] = typeof v === "string" ? cleanText(v) : v; });
+  return out;
+};
+
+const parseCSV = (text, batchId, rules) => {
+  const result = Papa.parse(text, { header:true, skipEmptyLines:"greedy", dynamicTyping:false, delimitersToGuess:[",","\t",";"] });
+  const rows = (result.data || []).map(normalizeRow).filter(row => Object.values(row).some(v => cleanText(v)));
+  if (!rows.length) return { txns: [], errors: [{ message:"CSV にデータがありません" }], source:"Unknown" };
+
+  const headers = Object.keys(rows[0]);
+  const src = detectSource(headers);
+  const now = new Date().toISOString();
+  const errors = [];
+
+  const txns = rows.map((row, idx) => {
+    let dateRaw, merchant, amountRaw, memo;
+    const rawStr = JSON.stringify(row);
+
+    if (src === "PayPay") {
+      dateRaw = pick(row, ["取引日時", "日時", "日付", "利用日"]);
+      merchant = pick(row, ["取引先", "店舗名", "加盟店名", "内容"]);
+      amountRaw = pick(row, ["金額(税込)", "金額", "利用金額", "支払金額"]);
+      memo = pick(row, ["取引種別", "備考", "メモ"]);
+    } else if (src === "EPOS") {
+      dateRaw = pick(row, ["ご利用日", "利用日", "日付"]);
+      merchant = pick(row, ["ご利用店名", "利用店名", "ご利用先", "店名"]);
+      amountRaw = pick(row, ["ご利用金額", "利用金額", "金額"]);
+      memo = pick(row, ["備考", "支払区分", "メモ"]);
+    } else {
+      dateRaw = pick(row, ["利用日", "ご利用日", "日付", "取引日", "年月日"]);
+      merchant = pick(row, ["利用先", "ご利用先", "店名", "加盟店名", "摘要", "内容"]);
+      amountRaw = pick(row, ["利用金額", "金額", "出金額", "支払金額"]);
+      memo = pick(row, ["備考", "メモ", "摘要", "内容"]);
+    }
+
+    const date = normalizeDate(dateRaw);
+    const signedAmount = parseAmount(amountRaw);
+    if (!date || !Number.isFinite(signedAmount)) {
+      errors.push({ row: idx + 2, message: `日付または金額を解析できません`, raw: rawStr });
+      return null;
+    }
+
+    const type = detectTxnType(merchant, memo, signedAmount);
+    const txn = {
+      id: uid(), date, amount: Math.abs(signedAmount), merchant: cleanText(merchant) || cleanText(memo) || "未記入",
+      memo: cleanText(memo), categoryMain: "", categorySub: "",
+      paymentMethod: src === "PayPay" ? "PayPay" : src === "EPOS" ? "EPOS" : "Olive",
+      source: src, importBatchId: batchId, raw: rawStr,
+      type, excludedFromStats: type !== "expense",
+      createdAt: now, updatedAt: now,
+    };
+
+    const rule = matchRules(rules, txn);
+    if (rule) { txn.categoryMain = rule.catMain; txn.categorySub = rule.catSub; }
+    return txn;
+  }).filter(Boolean);
+
+  return { txns, errors, source: src };
+};
+
+const findDuplicates = (newTxns, existing) => {
+  return newTxns.filter(n => existing.some(e => txnKey(e) === txnKey(n)));
+};
+
+const decodeFile = async (file, preferredEncoding = "auto") => {
+  const buffer = await file.arrayBuffer();
+  const decode = (enc) => new TextDecoder(enc, { fatal:false }).decode(buffer);
+  if (preferredEncoding !== "auto") return { text: decode(preferredEncoding), encoding: preferredEncoding };
+
+  const utf8 = decode("utf-8");
+  const sjis = decode("shift-jis");
+  const badness = s => (s.match(/�/g) || []).length;
+  return badness(sjis) < badness(utf8) ? { text: sjis, encoding:"shift-jis" } : { text: utf8, encoding:"utf-8" };
+};
+
+/* ═══════════════════════════════════════════
+   5. UI COMPONENTS
+   ═══════════════════════════════════════════ */
+
+const Modal = ({ open, onClose, title, children }) => {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" onClick={onClose}>
+      <div className="absolute inset-0" style={{background:"rgba(0,0,0,0.35)",backdropFilter:"blur(4px)"}} />
+      <div onClick={e=>e.stopPropagation()} className="relative w-full max-w-lg rounded-t-3xl overflow-hidden"
+        style={{background:"var(--card)",maxHeight:"85vh",display:"flex",flexDirection:"column"}}>
+        <div className="flex items-center justify-between px-5 py-4" style={{borderBottom:"1px solid var(--border)"}}>
+          <h3 className="text-lg font-semibold" style={{color:"var(--text)"}}>{title}</h3>
+          <button onClick={onClose} className="text-2xl leading-none" style={{color:"var(--text2)"}}>×</button>
+        </div>
+        <div className="overflow-y-auto px-5 py-4 flex-1">{children}</div>
+      </div>
+    </div>
+  );
+};
+
+const Pill = ({ text, color, small }) => (
+  <span className={`inline-block rounded-full font-medium ${small ? "text-xs px-2 py-0.5" : "text-sm px-3 py-1"}`}
+    style={{background: color+"22", color}}>{text}</span>
+);
+
+const Select = ({ value, onChange, options, placeholder }) => (
+  <select value={value} onChange={e=>onChange(e.target.value)}
+    className="w-full rounded-xl px-3 py-2.5 text-sm outline-none"
+    style={{background:"var(--input)",color:"var(--text)",border:"1px solid var(--border)"}}>
+    {placeholder && <option value="">{placeholder}</option>}
+    {options.map(o => <option key={typeof o==="string"?o:o.v} value={typeof o==="string"?o:o.v}>
+      {typeof o==="string"?o:o.l}</option>)}
+  </select>
+);
+
+const Input = ({ value, onChange, placeholder, type="text", ...rest }) => (
+  <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
+    className="w-full rounded-xl px-3 py-2.5 text-sm outline-none"
+    style={{background:"var(--input)",color:"var(--text)",border:"1px solid var(--border)"}} {...rest} />
+);
+
+const Btn = ({ children, onClick, primary, danger, small, disabled, className="" }) => (
+  <button onClick={onClick} disabled={disabled}
+    className={`rounded-xl font-medium transition-all active:scale-95 ${small?"text-xs px-3 py-1.5":"text-sm px-4 py-2.5"} ${className}`}
+    style={{
+      background: danger ? "#e44e4e" : primary ? "var(--accent)" : "var(--input)",
+      color: primary || danger ? "#fff" : "var(--text)",
+      opacity: disabled ? 0.5 : 1, border: primary||danger ? "none" : "1px solid var(--border)"
+    }}>{children}</button>
+);
+
+const Range = ({ value, onChange, min, max, step }) => (
+  <input type="range" value={value} min={min} max={max} step={step}
+    onChange={e=>onChange(Number(e.target.value))}
+    className="w-full h-1 rounded-lg appearance-none cursor-pointer"
+    style={{accentColor:"var(--accent)",background:"var(--border)"}} />
+);
+
+const CatPicker = ({ main, sub, onMainChange, onSubChange }) => (
+  <div className="flex gap-2">
+    <div className="flex-1">
+      <Select value={main} onChange={v => { onMainChange(v); onSubChange("") }}
+        placeholder="大类" options={CAT_KEYS.map(k => ({v:k, l:CATS[k].icon+" "+CATS[k].name}))} />
+    </div>
+    <div className="flex-1">
+      <Select value={sub} onChange={onSubChange} placeholder="子类"
+        options={main && CATS[main] ? CATS[main].subs : []} />
+    </div>
+  </div>
+);
+
+/* ═══════════════════════════════════════════
+   6. MAIN APP
+   ═══════════════════════════════════════════ */
+
+export default function App() {
+  const [darkMode, setDarkMode] = useState("light");
+  const [systemDark, setSystemDark] = useState(false);
+  const [tab, setTab] = useState("dash");
+  const [month, setMonth] = useState(() => {
+    const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+  });
+  const [txns, setTxns] = useState([]);
+  const [rules, setRules] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [themeColor, setThemeColor] = useState("#d4736b");
+  const [bgUrl, setBgUrl] = useState("");
+  const [bgImage, setBgImage] = useState("");
+  const [bgImageData, setBgImageData] = useState("");
+  const [bgBlur, setBgBlur] = useState(0);
+  const [bgOverlay, setBgOverlay] = useState(0.78);
+  const [fontSize, setFontSize] = useState(16);
+  
+  // Modals
+  const [editId, setEditId] = useState(null);
+  const [importPreview, setImportPreview] = useState(null);
+  const [skipDupes, setSkipDupes] = useState(true);
+  const [csvEncoding, setCsvEncoding] = useState("auto");
+  const [ruleEdit, setRuleEdit] = useState(null);
+  const [drillCat, setDrillCat] = useState(null);
+  
+  // Filters
+  const [fCat, setFCat] = useState("");
+  const [fSub, setFSub] = useState("");
+  const [fPm, setFPm] = useState("");
+  const [fKw, setFKw] = useState("");
+  const [fUncat, setFUncat] = useState(false);
+  
+  // Manual entry
+  const [mDate, setMDate] = useState(today());
+  const [mAmt, setMAmt] = useState("");
+  const [mMerch, setMMerch] = useState("");
+  const [mMemo, setMMemo] = useState("");
+  const [mCatM, setMCatM] = useState("");
+  const [mCatS, setMCatS] = useState("");
+
+  // Load
+  useEffect(() => {
+    (async () => {
+      const t = await db.get("txns"); if (t) setTxns(t);
+      const r = await db.get("rules"); if (r) setRules(r);
+      const dm = await db.get("darkMode");
+      if (dm) setDarkMode(dm);
+      else {
+        const d = await db.get("dark");
+        if (d !== null) setDarkMode(d ? "dark" : "light");
+      }
+      const tc = await db.get("themeColor"); if (tc) setThemeColor(tc);
+      const bu = await db.get("bgUrl"); if (bu) setBgUrl(bu);
+      const bi = await db.get("bgImage"); if (bi) setBgImage(bi);
+      const bb = await db.get("bgBlur"); if (bb !== null) setBgBlur(bb);
+      const bo = await db.get("bgOverlay"); if (bo !== null) setBgOverlay(bo);
+      const fs = await db.get("fontSize"); if (fs !== null) setFontSize(fs);
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const sync = () => setSystemDark(mq.matches);
+    sync();
+    mq.addEventListener?.("change", sync);
+    return () => mq.removeEventListener?.("change", sync);
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!isAssetId(bgImage)) { setBgImageData(bgImage || ""); return; }
+      try {
+        const data = await assetDb.get(bgImage);
+        if (alive) setBgImageData(data);
+      } catch (e) {
+        console.warn("Background asset load failed", e);
+        if (alive) setBgImageData("");
+      }
+    })();
+    return () => { alive = false; };
+  }, [bgImage]);
+
+  // Save
+  useEffect(() => { if (loaded) db.set("txns", txns) }, [txns, loaded]);
+  useEffect(() => { if (loaded) db.set("rules", rules) }, [rules, loaded]);
+  useEffect(() => { if (loaded) db.set("darkMode", darkMode) }, [darkMode, loaded]);
+  useEffect(() => { if (loaded) db.set("themeColor", themeColor) }, [themeColor, loaded]);
+  useEffect(() => { if (loaded) db.set("bgUrl", bgUrl) }, [bgUrl, loaded]);
+  useEffect(() => { if (loaded) db.set("bgImage", bgImage) }, [bgImage, loaded]);
+  useEffect(() => { if (loaded) db.set("bgBlur", bgBlur) }, [bgBlur, loaded]);
+  useEffect(() => { if (loaded) db.set("bgOverlay", bgOverlay) }, [bgOverlay, loaded]);
+  useEffect(() => { if (loaded) db.set("fontSize", fontSize) }, [fontSize, loaded]);
+
+  // Computed
+  const monthTxns = useMemo(() => txns.filter(t => getMonth(t.date) === month), [txns, month]);
+  const statsTxns = useMemo(() => monthTxns.filter(t => !t.excludedFromStats && (t.type || "expense") === "expense"), [monthTxns]);
+  const prevMonth = shiftMonth(month, -1);
+  const prevStatsTxns = useMemo(() => txns.filter(t => getMonth(t.date) === prevMonth && !t.excludedFromStats && (t.type || "expense") === "expense"), [txns, prevMonth]);
+  
+  const totalSpend = useMemo(() => _.sumBy(statsTxns, "amount"), [statsTxns]);
+  const prevTotal = useMemo(() => _.sumBy(prevStatsTxns, "amount"), [prevStatsTxns]);
+  const daysInMonth = new Date(+month.split("-")[0], +month.split("-")[1], 0).getDate();
+  const dailyAvg = Math.round(totalSpend / (daysInMonth || 1));
+  const maxTxn = useMemo(() => _.maxBy(statsTxns, "amount"), [statsTxns]);
+  const uncatCount = useMemo(() => statsTxns.filter(t => !t.categoryMain).length, [statsTxns]);
+  const changePercent = prevTotal ? Math.round((totalSpend - prevTotal) / prevTotal * 100) : null;
+
+  const catData = useMemo(() => {
+    const grouped = _.groupBy(statsTxns.filter(t=>t.categoryMain), "categoryMain");
+    return CAT_KEYS.map(k => ({
+      key: k, name: CATS[k].icon+" "+CATS[k].name, value: _.sumBy(grouped[k]||[], "amount"), color: CATS[k].color, count: (grouped[k]||[]).length
+    })).filter(d => d.value > 0).sort((a,b) => b.value - a.value);
+  }, [statsTxns]);
+
+  const pmData = useMemo(() => {
+    const grouped = _.groupBy(statsTxns, "paymentMethod");
+    return PM_LIST.map(pm => ({ name:pm, value: _.sumBy(grouped[pm]||[], "amount"), color: PM_COLORS[pm] })).filter(d=>d.value>0);
+  }, [statsTxns]);
+
+  const filteredTxns = useMemo(() => {
+    let list = monthTxns;
+    if (fCat) list = list.filter(t => t.categoryMain === fCat);
+    if (fSub) list = list.filter(t => t.categorySub === fSub);
+    if (fPm) list = list.filter(t => t.paymentMethod === fPm);
+    if (fKw) { const kw = fKw.toLowerCase(); list = list.filter(t => (t.merchant+t.memo).toLowerCase().includes(kw)); }
+    if (fUncat) list = list.filter(t => !t.categoryMain);
+    return _.orderBy(list, ["date","createdAt"], ["desc","desc"]);
+  }, [monthTxns, fCat, fSub, fPm, fKw, fUncat]);
+
+  const groupedTxns = useMemo(() => {
+    const groups = _.groupBy(filteredTxns, "date");
+    return Object.entries(groups).sort((a,b) => b[0].localeCompare(a[0])).map(([date, items]) => ({
+      date, weekday: weekday(date), total: _.sumBy(items, "amount"), items
+    }));
+  }, [filteredTxns]);
+
+  // Actions
+  const updateTxn = (id, patch) => {
+    setTxns(prev => prev.map(t => t.id === id ? {...t, ...patch, updatedAt: new Date().toISOString()} : t));
+  };
+
+  const handleImport = async (file) => {
+    try {
+      const { text, encoding } = await decodeFile(file, csvEncoding);
+      const batchId = uid();
+      const parsed = parseCSV(text, batchId, rules);
+      if (!parsed.txns.length) {
+        alert(parsed.errors?.length ? `未能解析交易记录：${parsed.errors[0].message}` : "未能解析任何交易记录");
+        return;
+      }
+      const dupes = findDuplicates(parsed.txns, txns);
+      const dupeKeys = new Set(dupes.map(txnKey));
+      const dates = parsed.txns.map(t=>t.date).filter(Boolean).sort();
+      setSkipDupes(true);
+      setImportPreview({
+        txns: parsed.txns.map(t => ({ ...t, isDuplicate: dupeKeys.has(txnKey(t)) })), batchId,
+        source: parsed.source || parsed.txns[0]?.source || "Unknown",
+        encoding,
+        dateRange: dates.length ? `${fmtDate(dates[0])} ~ ${fmtDate(dates[dates.length-1])}` : "-",
+        count: parsed.txns.length,
+        total: _.sumBy(parsed.txns.filter(t => !t.excludedFromStats), "amount"),
+        uncatCount: parsed.txns.filter(t => !t.categoryMain && !t.excludedFromStats).length,
+        excludedCount: parsed.txns.filter(t => t.excludedFromStats).length,
+        dupeCount: dupes.length,
+        errorCount: parsed.errors?.length || 0,
+        sample: parsed.txns.slice(0, 8),
+      });
+    } catch (e) {
+      console.error(e);
+      alert("读取 CSV 失败，请确认文件格式");
+    }
+  };
+
+  const confirmImport = () => {
+    if (!importPreview) return;
+    const importing = skipDupes ? importPreview.txns.filter(t => !t.isDuplicate) : importPreview.txns;
+    setTxns(prev => [...prev, ...importing.map(({isDuplicate, ...t}) => t)]);
+    setImportPreview(null);
+  };
+
+  const undoImport = (batchId) => {
+    if (!confirm("确定撤销此次导入？")) return;
+    setTxns(prev => prev.filter(t => t.importBatchId !== batchId));
+  };
+
+  const addManual = () => {
+    const parsedAmt = parseAmount(mAmt);
+    if (!Number.isFinite(parsedAmt) || !mDate) return;
+    const txn = {
+      id: uid(), date: mDate, amount: Math.abs(parsedAmt), merchant: mMerch.trim(), memo: mMemo.trim(),
+      categoryMain: mCatM, categorySub: mCatS, paymentMethod: "現金",
+      source: "manual", importBatchId: "", raw: "",
+      type: "expense", excludedFromStats: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    };
+    setTxns(prev => [...prev, txn]);
+    setMAmt(""); setMMerch(""); setMMemo(""); setMCatM(""); setMCatS("");
+  };
+
+  const exportData = async () => {
+    const assets = [];
+    if (isAssetId(bgImage)) {
+      try {
+        const data = await assetDb.get(bgImage);
+        if (data) assets.push({ id:bgImage, data });
+      } catch (e) {
+        console.warn("Background asset export failed", e);
+      }
+    }
+    const payload = {
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      txns,
+      rules,
+      appearance: { darkMode, themeColor, bgUrl, bgImage, bgBlur, bgOverlay, fontSize },
+      assets
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type:"application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `nenei-kakeibo-${today()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importBackup = async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      const source = payload.data || payload;
+      if (!source || typeof source !== "object") throw new Error("备份格式不正确");
+      if (!confirm("导入备份会覆盖当前账本和外观设置。确定继续？")) return;
+      await assetDb.sync(payload.assets || source.assets || []);
+      setTxns(Array.isArray(source.txns) ? source.txns : []);
+      setRules(Array.isArray(source.rules) ? source.rules : []);
+      const ap = source.appearance || {};
+      setDarkMode(ap.darkMode || (ap.dark ? "dark" : "light"));
+      setThemeColor(ap.themeColor || "#d4736b");
+      setBgUrl(ap.bgUrl || "");
+      setBgImage(ap.bgImage || "");
+      setBgBlur(Number(ap.bgBlur || 0));
+      setBgOverlay(Number(ap.bgOverlay ?? 0.78));
+      setFontSize(Number(ap.fontSize || 16));
+    } catch (e) {
+      console.error(e);
+      alert("导入失败：" + e.message);
+    }
+  };
+
+  const uploadBackground = async (file) => {
+    if (!file) return;
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const id = await assetDb.save(dataUrl);
+      setBgImage(id);
+      setBgImageData(dataUrl);
+      setBgUrl("");
+    } catch (e) {
+      console.error(e);
+      alert("背景图保存失败");
+    }
+  };
+
+  const clearBackground = () => { setBgUrl(""); setBgImage(""); };
+
+  const saveRule = (rule) => {
+    if (rule.id) {
+      setRules(prev => prev.map(r => r.id === rule.id ? rule : r));
+    } else {
+      setRules(prev => [...prev, { ...rule, id: uid() }]);
+    }
+    setRuleEdit(null);
+  };
+
+  const applyRulesToHistory = (rule) => {
+    setTxns(prev => prev.map(t => {
+      if (t.categoryMain) return t;
+      const txt = (t.merchant + " " + (t.memo||"")).toLowerCase();
+      const kw = rule.keyword.toLowerCase();
+      const match = rule.matchType === "exact" ? txt === kw : txt.includes(kw);
+      if (!match) return t;
+      if (rule.pmCondition && rule.pmCondition !== t.paymentMethod) return t;
+      return { ...t, categoryMain: rule.catMain, categorySub: rule.catSub, updatedAt: new Date().toISOString() };
+    }));
+  };
+
+  // CSS Variables
+  const dark = darkMode === "dark" || (darkMode === "auto" && systemDark);
+  const [ar, ag, ab] = hexToRgb(themeColor);
+  const hasBg = !!(bgUrl || bgImageData);
+  const overlayRgb = dark ? "28,25,23" : "248,245,240";
+  const theme = dark ? {
+    "--bg":"#1c1917","--card":hasBg?"rgba(41,37,36,0.88)":"#292524","--input":hasBg?"rgba(61,56,53,0.78)":"#3d3835","--border":hasBg?"rgba(231,229,228,0.16)":"#4a4540",
+    "--text":"#e7e5e4","--text2":"#a8a29e","--text3":"#78716c","--accent":themeColor,"--accent2":"#e8985a",
+    "--accent-rgb":`${ar},${ag},${ab}`,"--text-scale":fontSize / 16,"--glass":hasBg?"rgba(41,37,36,0.72)":"rgba(41,37,36,0.8)"
+  } : {
+    "--bg":"#f8f5f0","--card":hasBg?"rgba(255,255,255,0.88)":"#ffffff","--input":hasBg?"rgba(243,239,233,0.74)":"#f3efe9","--border":hasBg?"rgba(45,41,38,0.12)":"#e8e2d9",
+    "--text":"#2d2926","--text2":"#8a8078","--text3":"#b5ada4","--accent":themeColor,"--accent2":"#e8985a",
+    "--accent-rgb":`${ar},${ag},${ab}`,"--text-scale":fontSize / 16,"--glass":hasBg?"rgba(255,255,255,0.72)":"rgba(255,255,255,0.8)"
+  };
+  const bgImageStyle = bgUrl ? `url("${bgUrl}")` : bgImageData ? `url("${bgImageData}")` : "none";
+
+  const editTxn = editId ? txns.find(t=>t.id===editId) : null;
+  
+  const recentManual = useMemo(() =>
+    txns.filter(t=>t.source==="manual").sort((a,b)=>b.createdAt.localeCompare(a.createdAt)).slice(0,5)
+  , [txns]);
+
+  const importBatches = useMemo(() => {
+    const batches = _.groupBy(txns.filter(t=>t.importBatchId), "importBatchId");
+    return Object.entries(batches).map(([bid, items]) => ({
+      id: bid, source: items[0].source, count: items.length,
+      date: items[0].createdAt?.slice(0,10), total: _.sumBy(items,"amount")
+    })).sort((a,b) => (b.date||"").localeCompare(a.date||""));
+  }, [txns]);
+
+  /* ─── RENDER ─── */
+
+  const tabItems = [
+    { key:"dash", icon:"📊", label:"仪表盘" },
+    { key:"list", icon:"📋", label:"明细" },
+    { key:"add",  icon:"✏️", label:"补录" },
+    { key:"settings", icon:"⚙️", label:"设置" },
+  ];
+
+  return (
+    <div className="nenei-app" style={{...theme, background:"var(--bg)", color:"var(--text)", minHeight:"100vh", fontFamily:"-apple-system,BlinkMacSystemFont,'Hiragino Sans',sans-serif",
+      display:"flex",flexDirection:"column",maxWidth:480,margin:"0 auto",position:"relative",overflow:"hidden"}}>
+      <style>{`
+        .nenei-app .text-xs { font-size: calc(0.75rem * var(--text-scale)) !important; line-height: calc(1rem * var(--text-scale)) !important; }
+        .nenei-app .text-sm { font-size: calc(0.875rem * var(--text-scale)) !important; line-height: calc(1.25rem * var(--text-scale)) !important; }
+        .nenei-app .text-lg { font-size: calc(1.125rem * var(--text-scale)) !important; line-height: calc(1.75rem * var(--text-scale)) !important; }
+        .nenei-app .text-xl { font-size: calc(1.25rem * var(--text-scale)) !important; line-height: calc(1.75rem * var(--text-scale)) !important; }
+        .nenei-app .text-2xl { font-size: calc(1.5rem * var(--text-scale)) !important; line-height: calc(2rem * var(--text-scale)) !important; }
+      `}</style>
+      {hasBg && (
+        <>
+          <div style={{position:"fixed",inset:0,maxWidth:480,margin:"0 auto",backgroundImage:bgImageStyle,backgroundSize:"cover",backgroundPosition:"center",
+            filter:`blur(${bgBlur}px)`,transform:bgBlur?"scale(1.04)":"none",zIndex:0,pointerEvents:"none"}} />
+          <div style={{position:"fixed",inset:0,maxWidth:480,margin:"0 auto",background:`rgba(${overlayRgb},${bgOverlay})`,zIndex:0,pointerEvents:"none"}} />
+        </>
+      )}
+      
+      {/* Header */}
+      <div className="flex items-center justify-between px-5 pt-4 pb-2" style={{position:"relative",zIndex:1}}>
+        <button onClick={()=>setMonth(shiftMonth(month,-1))} className="text-xl p-1" style={{color:"var(--text2)"}}>‹</button>
+        <h1 className="text-lg font-bold tracking-tight">{fmtMonth(month)}</h1>
+        <button onClick={()=>setMonth(shiftMonth(month,1))} className="text-xl p-1" style={{color:"var(--text2)"}}>›</button>
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto pb-24 px-4" style={{position:"relative",zIndex:1}}>
+
+        {/* ═══ DASHBOARD ═══ */}
+        {tab === "dash" && (
+          <div className="space-y-4 pt-2">
+            {/* Summary Cards */}
+            <div className="grid grid-cols-2 gap-3">
+              {[
+                { label:"总支出", value: fmtAmt(totalSpend), sub: changePercent !== null ? `${changePercent > 0 ? "↑":"↓"}${Math.abs(changePercent)}% 环比` : "—" },
+                { label:"日均", value: fmtAmt(dailyAvg) },
+                { label:"最大单笔", value: maxTxn ? fmtAmt(maxTxn.amount) : "—", sub: maxTxn?.merchant?.slice(0,10) },
+                { label:"未分类", value: uncatCount+"笔", sub: uncatCount > 0 ? "需要归类" : "全部已分类", alert: uncatCount > 0 },
+              ].map((c,i) => (
+                <div key={i} className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}
+                  onClick={()=>{ if(c.alert){ setFUncat(true); setTab("list") }}}>
+                  <div className="text-xs mb-1" style={{color:"var(--text2)"}}>{c.label}</div>
+                  <div className="text-xl font-bold" style={c.alert?{color:"var(--accent)"}:{}}>{c.value}</div>
+                  {c.sub && <div className="text-xs mt-0.5" style={{color: c.alert?"var(--accent)":"var(--text3)"}}>{c.sub}</div>}
+                </div>
+              ))}
+            </div>
+
+            {/* Pie Chart */}
+            {!drillCat ? (
+              <div className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+                <div className="text-sm font-semibold mb-3" style={{color:"var(--text2)"}}>分类占比</div>
+                {catData.length > 0 ? (
+                  <>
+                    <div style={{height:200}}>
+                      <ResponsiveContainer>
+                        <PieChart>
+                          <Pie data={catData} dataKey="value" cx="50%" cy="50%" innerRadius={50} outerRadius={80}
+                            paddingAngle={2} onClick={(d)=>setDrillCat(d.key)} style={{cursor:"pointer",outline:"none"}}>
+                            {catData.map(d => <Cell key={d.key} fill={d.color} stroke="none" />)}
+                          </Pie>
+                          <Tooltip formatter={v=>[fmtAmt(v),""]} contentStyle={{borderRadius:12,border:"none",boxShadow:"0 2px 8px rgba(0,0,0,0.1)",background:"var(--card)",color:"var(--text)"}} />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <div className="space-y-2 mt-3">
+                      {catData.map(d => (
+                        <div key={d.key} className="flex items-center justify-between py-1.5 rounded-xl px-3 transition-colors"
+                          style={{cursor:"pointer"}} onClick={()=>setDrillCat(d.key)}>
+                          <div className="flex items-center gap-2">
+                            <span className="w-2.5 h-2.5 rounded-full" style={{background:d.color}} />
+                            <span className="text-sm">{d.name}</span>
+                            <span className="text-xs" style={{color:"var(--text3)"}}>{d.count}笔</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium">{fmtAmt(d.value)}</span>
+                            <span className="text-xs" style={{color:"var(--text3)"}}>{totalSpend?Math.round(d.value/totalSpend*100):0}%</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : <div className="text-center py-8 text-sm" style={{color:"var(--text3)"}}>本月暂无数据</div>}
+              </div>
+            ) : (
+              /* Drill into subcategory */
+              <div className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+                <div className="flex items-center gap-2 mb-3">
+                  <button onClick={()=>setDrillCat(null)} className="text-lg" style={{color:"var(--accent)"}}>‹</button>
+                  <span className="text-sm font-semibold">{CATS[drillCat]?.icon} {CATS[drillCat]?.name} 明细</span>
+                </div>
+                {(() => {
+                  const subs = statsTxns.filter(t=>t.categoryMain===drillCat);
+                  const subGroups = _.groupBy(subs, t=>t.categorySub||"未分類");
+                  const subData = Object.entries(subGroups).map(([name,items])=>({
+                    name, value:_.sumBy(items,"amount"), count:items.length
+                  })).sort((a,b)=>b.value-a.value);
+                  const catTotal = _.sumBy(subs,"amount");
+                  return (
+                    <div className="space-y-2">
+                      <div className="text-xl font-bold mb-2">{fmtAmt(catTotal)}</div>
+                      {subData.map(d => (
+                        <div key={d.name} className="flex items-center justify-between py-2">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm">{d.name}</span>
+                            <span className="text-xs" style={{color:"var(--text3)"}}>{d.count}笔</span>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <div className="h-1.5 rounded-full" style={{width:Math.max(20,d.value/catTotal*120),background:CATS[drillCat]?.color}} />
+                            <span className="text-sm font-medium w-20 text-right">{fmtAmt(d.value)}</span>
+                          </div>
+                        </div>
+                      ))}
+                      <Btn small onClick={()=>{ setFCat(drillCat); setDrillCat(null); setTab("list") }}>查看全部明细 →</Btn>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Payment method breakdown */}
+            {pmData.length > 0 && !drillCat && (
+              <div className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+                <div className="text-sm font-semibold mb-3" style={{color:"var(--text2)"}}>支付方式</div>
+                <div className="space-y-2">
+                  {pmData.map(d => (
+                    <div key={d.name} className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full" style={{background:d.color}} />
+                        <span className="text-sm">{d.name}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className="h-1.5 rounded-full" style={{width:Math.max(20,d.value/totalSpend*100),background:d.color,opacity:0.7}} />
+                        <span className="text-sm font-medium">{fmtAmt(d.value)}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ═══ TRANSACTION LIST ═══ */}
+        {tab === "list" && (
+          <div className="space-y-3 pt-2">
+            {/* Filters */}
+            <div className="rounded-2xl p-3 space-y-2" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <Input value={fKw} onChange={setFKw} placeholder="搜索商户名或备注…" />
+              <div className="flex gap-2">
+                <div className="flex-1"><Select value={fCat} onChange={v=>{setFCat(v);setFSub("")}} placeholder="全部分类" options={CAT_KEYS.map(k=>({v:k,l:CATS[k].icon+" "+CATS[k].name}))} /></div>
+                <div className="flex-1"><Select value={fPm} onChange={setFPm} placeholder="支付方式" options={PM_LIST} /></div>
+              </div>
+              <div className="flex gap-2">
+                {fCat && <div className="flex-1"><Select value={fSub} onChange={setFSub} placeholder="全部子类" options={CATS[fCat]?.subs||[]} /></div>}
+                <button onClick={()=>setFUncat(!fUncat)} className="rounded-xl px-3 py-1.5 text-xs font-medium"
+                  style={{background:fUncat?"var(--accent)":"var(--input)",color:fUncat?"#fff":"var(--text)",border:"1px solid var(--border)"}}>
+                  未分类
+                </button>
+                {(fCat||fPm||fKw||fUncat||fSub) && (
+                  <button onClick={()=>{setFCat("");setFSub("");setFPm("");setFKw("");setFUncat(false)}}
+                    className="text-xs px-2" style={{color:"var(--accent)"}}>清除</button>
+                )}
+              </div>
+            </div>
+
+            {/* Grouped list */}
+            <div className="text-xs px-1 mb-1" style={{color:"var(--text3)"}}>{filteredTxns.length}笔交易</div>
+            {groupedTxns.map(g => (
+              <div key={g.date}>
+                <div className="flex justify-between items-center px-1 mb-1.5">
+                  <div className="text-xs font-medium" style={{color:"var(--text2)"}}>{fmtDate(g.date)} ({g.weekday})</div>
+                  <div className="text-xs font-medium" style={{color:"var(--text2)"}}>{fmtAmt(g.total)}</div>
+                </div>
+                <div className="rounded-2xl overflow-hidden" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+                  {g.items.map((t,i) => (
+                    <div key={t.id} className="flex items-center gap-3 px-4 py-3 active:bg-black/5 transition-colors"
+                      style={{borderTop:i?"1px solid var(--border)":"none",cursor:"pointer",opacity:t.excludedFromStats?0.5:1}}
+                      onClick={()=>setEditId(t.id)}>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-sm font-medium truncate">{highlightText(t.merchant || "不明", fKw)}</span>
+                          {t.excludedFromStats && <span className="text-xs" style={{color:"var(--text3)"}}>除外</span>}
+                        </div>
+                        <div className="flex items-center gap-1.5 mt-0.5">
+                          {t.categoryMain && <Pill small text={CATS[t.categoryMain]?.icon+" "+(t.categorySub||CATS[t.categoryMain]?.name)} color={CATS[t.categoryMain]?.color} />}
+                          {!t.categoryMain && <Pill small text="未分類" color="#999" />}
+                          {t.memo && <span className="text-xs truncate" style={{color:"var(--text3)"}}>{highlightText(t.memo, fKw)}</span>}
+                        </div>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <div className="text-sm font-semibold">-{fmtAmt(t.amount)}</div>
+                        <div className="text-xs mt-0.5" style={{color:PM_COLORS[t.paymentMethod]||"var(--text3)"}}>{t.paymentMethod}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+            {groupedTxns.length === 0 && <div className="text-center py-12 text-sm" style={{color:"var(--text3)"}}>暂无记录</div>}
+          </div>
+        )}
+
+        {/* ═══ MANUAL ENTRY ═══ */}
+        {tab === "add" && (
+          <div className="space-y-4 pt-2">
+            <div className="rounded-2xl p-4 space-y-3" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>现金补录</div>
+              <div className="flex gap-2">
+                <div className="flex-1"><Input type="date" value={mDate} onChange={setMDate} /></div>
+                <div className="flex-1"><Input type="number" value={mAmt} onChange={setMAmt} placeholder="金额" /></div>
+              </div>
+              <Input value={mMerch} onChange={setMMerch} placeholder="商户名" />
+              <Input value={mMemo} onChange={setMMemo} placeholder="备注（可选）" />
+              <CatPicker main={mCatM} sub={mCatS} onMainChange={setMCatM} onSubChange={setMCatS} />
+              <Btn primary onClick={addManual} disabled={!mAmt||!mDate} className="w-full">记一笔 💴</Btn>
+            </div>
+
+            {recentManual.length > 0 && (
+              <div className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+                <div className="text-sm font-semibold mb-2" style={{color:"var(--text2)"}}>最近补录</div>
+                {recentManual.map(t => (
+                  <div key={t.id} className="flex justify-between items-center py-2" style={{borderBottom:"1px solid var(--border)"}}>
+                    <div>
+                      <div className="text-sm">{t.merchant||"—"}</div>
+                      <div className="text-xs" style={{color:"var(--text3)"}}>{fmtDate(t.date)}{t.categorySub ? " · "+t.categorySub : ""}</div>
+                    </div>
+                    <span className="text-sm font-medium">{fmtAmt(t.amount)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ═══ SETTINGS ═══ */}
+        {tab === "settings" && (
+          <div className="space-y-4 pt-2">
+            <div className="rounded-2xl overflow-hidden" style={{background:"linear-gradient(135deg, rgba(var(--accent-rgb),0.18), var(--card))",boxShadow:"0 1px 4px rgba(0,0,0,0.06)",border:"1px solid var(--border)"}}>
+              <div className="px-4 py-3 flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-semibold">设置</div>
+                  <div className="text-xs mt-0.5" style={{color:"var(--text2)"}}>数据 · 外观</div>
+                </div>
+                <div className="w-10 h-10 rounded-2xl" style={{background:`linear-gradient(135deg, var(--accent), rgba(var(--accent-rgb),0.28))`}} />
+              </div>
+            </div>
+
+            {/* Data */}
+            <div className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>数据</div>
+                <div className="flex gap-2">
+                  <label className="rounded-xl font-medium transition-all active:scale-95 text-xs px-3 py-1.5 cursor-pointer"
+                    style={{background:"var(--input)",color:"var(--text)",border:"1px solid var(--border)"}}>
+                    导入
+                    <input type="file" accept=".json,application/json" className="hidden" onChange={e=>{importBackup(e.target.files?.[0]); e.target.value = "";}} />
+                  </label>
+                  <Btn small onClick={exportData}>导出</Btn>
+                </div>
+              </div>
+              <div className="mb-3">
+                <Select value={csvEncoding} onChange={setCsvEncoding} options={[{v:"auto",l:"自动识别编码"},{v:"utf-8",l:"UTF-8"},{v:"shift-jis",l:"Shift_JIS / CP932"}]} />
+              </div>
+              <label className="block rounded-xl border-2 border-dashed p-6 text-center cursor-pointer transition-colors"
+                style={{borderColor:"var(--border)",color:"var(--text3)"}}
+                onDragOver={e=>{e.preventDefault(); e.currentTarget.style.borderColor="var(--accent)"}}
+                onDragLeave={e=>{e.currentTarget.style.borderColor="var(--border)"}}
+                onDrop={e=>{e.preventDefault(); e.currentTarget.style.borderColor="var(--border)"; const f=e.dataTransfer.files?.[0]; if(f) handleImport(f)}}>
+                <div className="text-2xl mb-1">📁</div>
+                <div className="text-sm">CSV 文件</div>
+                <input type="file" accept=".csv,text/csv" className="hidden" onChange={e=>e.target.files[0]&&handleImport(e.target.files[0])} />
+              </label>
+              {importBatches.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  <div className="text-xs font-medium" style={{color:"var(--text3)"}}>导入历史</div>
+                  {importBatches.slice(0,5).map(b => (
+                    <div key={b.id} className="flex justify-between items-center text-xs py-1.5">
+                      <span>{b.source} · {b.count}笔 · {fmtAmt(b.total)}</span>
+                      <button onClick={()=>undoImport(b.id)} className="px-2 py-0.5 rounded" style={{color:"var(--accent)"}}>撤销</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Appearance */}
+            <div className="rounded-2xl p-4 space-y-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>外观</div>
+                <div className="flex rounded-xl p-1" style={{background:"var(--input)",border:"1px solid var(--border)"}}>
+                  {[["light","浅"],["dark","深"],["auto","自动"]].map(([v,l]) => (
+                    <button key={v} onClick={()=>setDarkMode(v)} className="text-xs px-2.5 py-1 rounded-lg transition-colors"
+                      style={{background:darkMode===v?"var(--accent)":"transparent",color:darkMode===v?"#fff":"var(--text2)"}}>
+                      {l}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-xs font-medium mb-2" style={{color:"var(--text3)"}}>主题色</div>
+                <div className="flex items-center gap-2">
+                  {THEME_PRESETS.map(c => (
+                    <button key={c} onClick={()=>setThemeColor(c)} className="w-8 h-8 rounded-full transition-transform"
+                      style={{background:c,border:themeColor===c?"3px solid var(--text)":"3px solid transparent",transform:themeColor===c?"scale(1.05)":"none"}} />
+                  ))}
+                  <label className="w-8 h-8 rounded-full overflow-hidden border flex items-center justify-center" style={{borderColor:"var(--border)",background:"var(--input)"}}>
+                    <input type="color" value={themeColor} onChange={e=>setThemeColor(e.target.value)} className="w-10 h-10 border-0 p-0 cursor-pointer" />
+                  </label>
+                </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="text-xs font-medium" style={{color:"var(--text3)"}}>背景图</div>
+                  {(bgUrl || bgImage) && <button onClick={clearBackground} className="text-xs" style={{color:"var(--accent)"}}>清除</button>}
+                </div>
+                <Input value={bgUrl} onChange={v=>{setBgUrl(v); if(v) setBgImage("");}} placeholder="图片 URL" />
+                <div className="mt-2 flex gap-2">
+                  <label className="flex-1 rounded-xl px-3 py-2.5 text-sm text-center cursor-pointer"
+                    style={{background:"var(--input)",border:"1px solid var(--border)",color:"var(--text)"}}>
+                    上传
+                    <input type="file" accept="image/*" className="hidden" onChange={e=>uploadBackground(e.target.files?.[0])} />
+                  </label>
+                  <div className="w-20 rounded-xl overflow-hidden" style={{background:"var(--input)",border:"1px solid var(--border)"}}>
+                    {hasBg ? <div className="w-full h-full" style={{backgroundImage:bgImageStyle,backgroundSize:"cover",backgroundPosition:"center"}} /> :
+                      <div className="w-full h-full" style={{background:`linear-gradient(135deg, rgba(var(--accent-rgb),0.2), var(--input))`}} />}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <div className="flex justify-between text-xs mb-2" style={{color:"var(--text3)"}}><span>模糊</span><span>{bgBlur}px</span></div>
+                  <Range value={bgBlur} onChange={setBgBlur} min={0} max={20} step={1} />
+                </div>
+                <div>
+                  <div className="flex justify-between text-xs mb-2" style={{color:"var(--text3)"}}><span>遮罩</span><span>{Math.round(bgOverlay*100)}%</span></div>
+                  <Range value={bgOverlay} onChange={setBgOverlay} min={0.35} max={0.95} step={0.05} />
+                </div>
+              </div>
+
+              <div>
+                <div className="flex justify-between text-xs mb-2" style={{color:"var(--text3)"}}><span>字号</span><span>{fontSize}px</span></div>
+                <Range value={fontSize} onChange={setFontSize} min={14} max={19} step={0.5} />
+              </div>
+            </div>
+
+            {/* Rules */}
+            <div className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <div className="flex justify-between items-center mb-3">
+                <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>分类规则 ({rules.length})</div>
+                <Btn small primary onClick={()=>setRuleEdit({keyword:"",matchType:"contains",catMain:"",catSub:"",pmCondition:"",priority:10,enabled:true})}>新建</Btn>
+              </div>
+              {rules.length === 0 && <div className="text-xs py-4 text-center" style={{color:"var(--text3)"}}>暂无规则</div>}
+              <div className="space-y-2">
+                {_.orderBy(rules,["priority"],["desc"]).map(r => (
+                  <div key={r.id} className="flex items-center justify-between py-2 px-2 rounded-xl"
+                    style={{background:"var(--input)",opacity:r.enabled?1:0.5}}>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-sm font-medium truncate">「{r.keyword}」</span>
+                        <span className="text-xs" style={{color:"var(--text3)"}}>{r.matchType==="exact"?"完全一致":"包含"}</span>
+                      </div>
+                      <div className="text-xs mt-0.5" style={{color:"var(--text2)"}}>
+                        → {CATS[r.catMain]?.icon} {r.catSub||CATS[r.catMain]?.name}
+                        {r.pmCondition && ` · ${r.pmCondition}限定`}
+                        {` · 優先度${r.priority}`}
+                      </div>
+                    </div>
+                    <div className="flex gap-1 shrink-0">
+                      <button onClick={()=>applyRulesToHistory(r)} className="text-xs px-1.5 py-0.5 rounded" style={{color:"var(--accent)"}}>回溯</button>
+                      <button onClick={()=>setRuleEdit(r)} className="text-xs px-1.5 py-0.5 rounded" style={{color:"var(--text2)"}}>编辑</button>
+                      <button onClick={()=>setRules(prev=>prev.filter(x=>x.id!==r.id))} className="text-xs px-1.5 py-0.5 rounded" style={{color:"#c44"}}>删</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Data info */}
+            <div className="text-xs text-center py-2" style={{color:"var(--text3)"}}>
+              共 {txns.length} 笔交易 · {rules.length} 条规则
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ═══ TAB BAR ═══ */}
+      <div className="fixed bottom-0 left-0 right-0 flex justify-center" style={{zIndex:40}}>
+        <div className="w-full max-w-lg flex items-center justify-around py-2 pb-5"
+          style={{background:"var(--glass)",backdropFilter:"blur(16px)",borderTop:"1px solid var(--border)"}}>
+          {tabItems.map(t => (
+            <button key={t.key} onClick={()=>{setTab(t.key);if(t.key!=="list"){setFCat("");setFSub("");setFPm("");setFKw("");setFUncat(false)}setDrillCat(null)}}
+              className="flex flex-col items-center gap-0.5 px-4 py-1 transition-all"
+              style={{color:tab===t.key?"var(--accent)":"var(--text3)",transform:tab===t.key?"scale(1.05)":"scale(1)"}}>
+              <span className="text-lg">{t.icon}</span>
+              <span className="text-xs">{t.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ═══ MODALS ═══ */}
+      
+      {/* Import Preview */}
+      <Modal open={!!importPreview} onClose={()=>setImportPreview(null)} title="导入预览">
+        {importPreview && (
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-3">
+              {[
+                ["来源", importPreview.source],
+                ["日期范围", importPreview.dateRange],
+                ["交易笔数", importPreview.count+"笔"],
+                ["总金额", fmtAmt(importPreview.total)],
+                ["未分类", importPreview.uncatCount+"笔"],
+                ["非消费", importPreview.excludedCount+"笔"],
+                ["疑似重复", importPreview.dupeCount+"笔"],
+              ].map(([l,v],i) => (
+                <div key={i} className="py-2">
+                  <div className="text-xs" style={{color:"var(--text3)"}}>{l}</div>
+                  <div className="text-sm font-medium">{v}</div>
+                </div>
+              ))}
+            </div>
+            <div className="text-xs" style={{color:"var(--text3)"}}>编码：{importPreview.encoding}{importPreview.errorCount ? ` · 跳过异常 ${importPreview.errorCount} 行` : ""}</div>
+            {importPreview.dupeCount > 0 && (
+              <label className="flex items-center gap-2 text-xs p-3 rounded-xl" style={{background:"var(--accent)"+"18",color:"var(--accent)"}}>
+                <input type="checkbox" checked={skipDupes} onChange={e=>setSkipDupes(e.target.checked)} />
+                跳过疑似重复：{importPreview.dupeCount} 笔
+              </label>
+            )}
+            {importPreview.excludedCount > 0 && (
+              <div className="text-xs p-3 rounded-xl" style={{background:"var(--accent2)"+"18",color:"var(--accent2)"}}>
+                非消费：{importPreview.excludedCount} 笔
+              </div>
+            )}
+            <div className="rounded-xl overflow-hidden" style={{border:"1px solid var(--border)"}}>
+              <div className="text-xs px-3 py-2" style={{background:"var(--input)",color:"var(--text2)"}}>样本预览</div>
+              <div className="divide-y" style={{borderColor:"var(--border)"}}>
+                {importPreview.sample.map(t => (
+                  <div key={t.id} className="px-3 py-2 text-xs flex justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="truncate">{t.date} · {t.merchant}</div>
+                      <div style={{color:"var(--text3)"}}>{t.paymentMethod}{t.categorySub ? ` · ${t.categorySub}` : " · 未分類"}{t.excludedFromStats ? ` · ${t.type}` : ""}</div>
+                    </div>
+                    <div className="font-medium shrink-0">{fmtAmt(t.amount)}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <Btn className="flex-1" onClick={()=>setImportPreview(null)}>取消</Btn>
+              <Btn primary className="flex-1" onClick={confirmImport}>确认导入{skipDupes && importPreview.dupeCount ? ` ${importPreview.count-importPreview.dupeCount}笔` : ""}</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Transaction Edit */}
+      <Modal open={!!editTxn} onClose={()=>setEditId(null)} title="编辑交易">
+        {editTxn && <TxnEditor txn={editTxn} onSave={(id,patch)=>{updateTxn(id,patch);setEditId(null)}}
+          onCreateRule={(kw,catM,catS)=>setRuleEdit({keyword:kw,matchType:"contains",catMain:catM,catSub:catS,pmCondition:"",priority:10,enabled:true})}
+          onDelete={()=>{setTxns(prev=>prev.filter(t=>t.id!==editId));setEditId(null)}} />}
+      </Modal>
+
+      {/* Rule Edit */}
+      <Modal open={!!ruleEdit} onClose={()=>setRuleEdit(null)} title={ruleEdit?.id?"编辑规则":"新建规则"}>
+        {ruleEdit && <RuleEditForm rule={ruleEdit} onSave={saveRule} onCancel={()=>setRuleEdit(null)} />}
+      </Modal>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════
+   7. EDITOR COMPONENTS
+   ═══════════════════════════════════════════ */
+
+function TxnEditor({ txn, onSave, onCreateRule, onDelete }) {
+  const [merchant, setMerchant] = useState(txn.merchant);
+  const [memo, setMemo] = useState(txn.memo);
+  const [catM, setCatM] = useState(txn.categoryMain);
+  const [catS, setCatS] = useState(txn.categorySub);
+  const [pm, setPm] = useState(txn.paymentMethod);
+  const [excl, setExcl] = useState(txn.excludedFromStats);
+  const [askRule, setAskRule] = useState(false);
+
+  const save = () => {
+    onSave(txn.id, { merchant, memo, categoryMain:catM, categorySub:catS, paymentMethod:pm, excludedFromStats:excl });
+    if (askRule && merchant && catM) onCreateRule(merchant, catM, catS);
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex justify-between text-xs" style={{color:"var(--text3)"}}>
+        <span>{txn.date} · {txn.source}</span>
+        <span className="text-lg font-bold" style={{color:"var(--text)"}}>-{fmtAmt(txn.amount)}</span>
+      </div>
+      <Input value={merchant} onChange={setMerchant} placeholder="商户名" />
+      <Input value={memo} onChange={setMemo} placeholder="备注" />
+      <CatPicker main={catM} sub={catS} onMainChange={setCatM} onSubChange={setCatS} />
+      <Select value={pm} onChange={setPm} placeholder="支付方式" options={PM_LIST} />
+      <div className="flex items-center justify-between py-1">
+        <span className="text-sm">排除统计</span>
+        <button onClick={()=>setExcl(!excl)} className="w-10 h-6 rounded-full relative transition-colors"
+          style={{background:excl?"var(--accent)":"var(--border)"}}>
+          <div className="absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all" style={{left:excl?18:2}} />
+        </button>
+      </div>
+      {catM !== txn.categoryMain && catM && (
+        <label className="flex items-center gap-2 text-xs" style={{color:"var(--text2)"}}>
+          <input type="checkbox" checked={askRule} onChange={e=>setAskRule(e.target.checked)} />
+          同时保存为分类规则（关键词:「{merchant}」）
+        </label>
+      )}
+      <div className="flex gap-2 pt-2">
+        <Btn danger small onClick={onDelete}>删除</Btn>
+        <div className="flex-1" />
+        <Btn primary onClick={save}>保存</Btn>
+      </div>
+    </div>
+  );
+}
+
+function RuleEditForm({ rule, onSave, onCancel }) {
+  const [kw, setKw] = useState(rule.keyword);
+  const [mt, setMt] = useState(rule.matchType||"contains");
+  const [catM, setCatM] = useState(rule.catMain);
+  const [catS, setCatS] = useState(rule.catSub);
+  const [pmC, setPmC] = useState(rule.pmCondition||"");
+  const [pri, setPri] = useState(rule.priority||10);
+  const [en, setEn] = useState(rule.enabled!==false);
+
+  return (
+    <div className="space-y-3">
+      <Input value={kw} onChange={setKw} placeholder="匹配关键词" />
+      <Select value={mt} onChange={setMt} options={[{v:"contains",l:"包含匹配"},{v:"exact",l:"完全一致"}]} />
+      <CatPicker main={catM} sub={catS} onMainChange={setCatM} onSubChange={setCatS} />
+      <Select value={pmC} onChange={setPmC} placeholder="不限支付方式" options={PM_LIST} />
+      <div className="flex items-center gap-2">
+        <span className="text-sm shrink-0">优先级</span>
+        <Input type="number" value={pri} onChange={v=>setPri(Number(v))} />
+      </div>
+      <div className="flex items-center justify-between py-1">
+        <span className="text-sm">启用</span>
+        <button onClick={()=>setEn(!en)} className="w-10 h-6 rounded-full relative transition-colors"
+          style={{background:en?"var(--accent)":"var(--border)"}}>
+          <div className="absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all" style={{left:en?18:2}} />
+        </button>
+      </div>
+      <div className="flex gap-2 pt-2">
+        <Btn onClick={onCancel}>取消</Btn>
+        <Btn primary onClick={()=>onSave({...rule,keyword:kw,matchType:mt,catMain:catM,catSub:catS,pmCondition:pmC,priority:pri,enabled:en})} disabled={!kw||!catM}>保存</Btn>
+      </div>
+    </div>
+  );
+}
