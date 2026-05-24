@@ -499,6 +499,7 @@ const detectSource = (headers) => {
     has("取引日", "入金金額（円）") ||
     has("取引内容", "取引先", "取引方法")
   ) return "PayPay";
+  if (has("年月日", "お引出し", "お預入れ", "お取り扱い内容")) return "SMBC";
   if (h.includes("PayPay") || h.includes("取引種別") || h.includes("取引日時")) return "PayPay";
   if (h.includes("EPOS") || h.includes("エポス") || h.includes("ご利用店名")) return "EPOS";
   return "Olive";
@@ -546,6 +547,23 @@ const parseCSV = (text, batchId, rules) => {
       merchant = pick(row, ["ご利用店名", "利用店名", "ご利用先", "店名"]);
       amountRaw = pick(row, ["ご利用金額", "利用金額", "金額"]);
       memo = pick(row, ["備考", "支払区分", "メモ"]);
+    } else if (src === "SMBC") {
+      dateRaw = pick(row, ["年月日", "日付", "取引日", "利用日"]);
+      merchant = pick(row, ["お取り扱い内容", "お取扱内容", "お取引内容", "摘要", "内容"]);
+      memo = pick(row, ["メモ", "ラベル", "お取り扱い内容", "摘要", "内容"]);
+      const outRaw = pick(row, ["お引出し", "出金額", "出金", "支払金額", "金額"]);
+      const inRaw = pick(row, ["お預入れ", "入金額", "入金", "受取金額"]);
+      const outAmount = parseOptionalAmount(outRaw);
+      const inAmount = parseOptionalAmount(inRaw);
+      if (Number.isFinite(outAmount)) {
+        signedAmount = outAmount;
+        amountRaw = outRaw;
+        direction = "out";
+      } else if (Number.isFinite(inAmount)) {
+        signedAmount = -inAmount;
+        amountRaw = inRaw;
+        direction = "in";
+      }
     } else {
       dateRaw = pick(row, ["利用日", "ご利用日", "日付", "取引日", "年月日"]);
       merchant = pick(row, ["利用先", "ご利用先", "店名", "加盟店名", "摘要", "内容"]);
@@ -580,6 +598,23 @@ const parseCSV = (text, batchId, rules) => {
         type = "transfer";
         excludedFromStats = true;
       }
+    } else if (src === "SMBC") {
+      const bankText = `${cleanText(merchant)} ${cleanText(memo)}`.toUpperCase();
+      if (direction === "in") {
+        type = "transfer";
+        excludedFromStats = true;
+      }
+      if (bankText.includes("PAYPAY")) {
+        type = "charge";
+        excludedFromStats = true;
+      } else if (
+        bankText.includes("AEON PAY") ||
+        bankText.includes("ＡＥＯＮ") ||
+        bankText.includes("イオン")
+      ) {
+        type = "expense";
+        excludedFromStats = false;
+      }
     }
     const txn = {
       id: uid(), date, amount: Math.abs(signedAmount), merchant: cleanText(merchant) || cleanText(memo) || "未記入",
@@ -600,6 +635,20 @@ const parseCSV = (text, batchId, rules) => {
 
     const rule = matchRules(rules, txn);
     if (rule) { txn.categoryMain = rule.catMain; txn.categorySub = rule.catSub; }
+    if (src === "SMBC") {
+      const bankText = `${cleanText(txn.merchant)} ${cleanText(txn.memo)}`.toUpperCase();
+      if (
+        !txn.categoryMain &&
+        (
+          bankText.includes("AEON PAY") ||
+          bankText.includes("ＡＥＯＮ") ||
+          bankText.includes("イオン")
+        )
+      ) {
+        txn.categoryMain = "food";
+        txn.categorySub = "スーパー";
+      }
+    }
     return txn;
   }).filter(Boolean);
 
