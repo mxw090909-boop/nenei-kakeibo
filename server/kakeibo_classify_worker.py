@@ -27,7 +27,7 @@ CODEX_CLI = os.environ.get("KAKEIBO_CODEX_CLI", "codex")
 MODEL = os.environ.get("KAKEIBO_CLASSIFY_MODEL", "gpt-5.5")
 REASONING = os.environ.get("KAKEIBO_CLASSIFY_REASONING", "medium")
 DRY_RUN = os.environ.get("KAKEIBO_CLASSIFY_DRY_RUN", "0") == "1"
-TIMEOUT = int(os.environ.get("KAKEIBO_CLASSIFY_TIMEOUT", "90"))
+TIMEOUT = int(os.environ.get("KAKEIBO_CLASSIFY_TIMEOUT", "240"))
 
 
 CATEGORIES = {
