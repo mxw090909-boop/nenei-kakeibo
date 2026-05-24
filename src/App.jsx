@@ -174,6 +174,12 @@ const parseAmount = value => {
   return Number.isFinite(n) ? n : NaN;
 };
 
+const parseOptionalAmount = value => {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw === "-" || raw === "－") return NaN;
+  return parseAmount(raw);
+};
+
 const normalizeDate = value => {
   let raw = String(value ?? "").trim();
   if (!raw) return "";
@@ -210,6 +216,49 @@ const detectTxnType = (merchant, memo, amount) => {
 
 const detectNonConsume = (merchant, memo, amount = 0) => detectTxnType(merchant, memo, amount) !== "expense";
 
+const settlementLabel = {
+  none: "普通",
+  advance: "代付",
+  repayment: "还款",
+  aa_payment: "AA付款"
+};
+
+const statusLabel = {
+  none: "无",
+  pending: "待确认",
+  matched: "已绑定",
+  ignored: "已忽略"
+};
+
+const settlementTypeFromTxn = (txn = {}) => {
+  if (txn.settlementType) return txn.settlementType;
+  if (txn.type === "repayment") return "repayment";
+  if (txn.type === "aa_payment") return "aa_payment";
+  return "none";
+};
+
+const normalizeTxnSettlement = (txn = {}) => {
+  const amount = Math.abs(Number(txn.amount || 0));
+  const settlementType = settlementTypeFromTxn(txn);
+  const originalAmount = Math.abs(Number(txn.originalAmount ?? amount));
+  const offsetAmount = Math.max(0, Number(txn.offsetAmount ?? 0));
+  const effectiveAmount = Math.max(0, Number(txn.effectiveAmount ?? (settlementType === "repayment" ? 0 : originalAmount - offsetAmount)));
+  const settlementStatus = txn.settlementStatus || (settlementType === "none" ? "none" : "pending");
+  return {
+    ...txn,
+    amount,
+    settlementType,
+    settlementPerson: txn.settlementPerson || "",
+    linkedTransactionId: txn.linkedTransactionId || "",
+    originalAmount,
+    offsetAmount,
+    effectiveAmount,
+    settlementStatus
+  };
+};
+
+const statAmount = txn => Math.max(0, Number(txn?.effectiveAmount ?? txn?.amount ?? 0));
+
 const txnKey = t => `${t.date}|${Number(t.amount)}|${cleanText(t.merchant).toLowerCase()}|${t.paymentMethod}`;
 
 const matchRules = (rules, txn) => {
@@ -229,7 +278,14 @@ const matchRules = (rules, txn) => {
    ═══════════════════════════════════════════ */
 
 const detectSource = (headers) => {
-  const h = headers.map(s => cleanText(s)).join(",");
+  const hs = headers.map(s => cleanText(s));
+  const has = (...names) => names.every(name => hs.includes(name));
+  const h = hs.join(",");
+  if (
+    has("取引日", "出金金額（円）") ||
+    has("取引日", "入金金額（円）") ||
+    has("取引内容", "取引先", "取引方法")
+  ) return "PayPay";
   if (h.includes("PayPay") || h.includes("取引種別") || h.includes("取引日時")) return "PayPay";
   if (h.includes("EPOS") || h.includes("エポス") || h.includes("ご利用店名")) return "EPOS";
   return "Olive";
@@ -252,14 +308,26 @@ const parseCSV = (text, batchId, rules) => {
   const errors = [];
 
   const txns = rows.map((row, idx) => {
-    let dateRaw, merchant, amountRaw, memo;
+    let dateRaw, merchant, amountRaw, memo, signedAmount, direction = "";
     const rawStr = JSON.stringify(row);
 
     if (src === "PayPay") {
-      dateRaw = pick(row, ["取引日時", "日時", "日付", "利用日"]);
+      dateRaw = pick(row, ["取引日", "取引日時", "日時", "日付", "利用日"]);
       merchant = pick(row, ["取引先", "店舗名", "加盟店名", "内容"]);
-      amountRaw = pick(row, ["金額(税込)", "金額", "利用金額", "支払金額"]);
-      memo = pick(row, ["取引種別", "備考", "メモ"]);
+      memo = pick(row, ["取引内容", "取引方法", "備考", "メモ"]);
+      const outRaw = pick(row, ["出金金額（円）", "出金金額", "支払金額", "金額(税込)", "金額"]);
+      const inRaw = pick(row, ["入金金額（円）", "入金金額", "受取金額"]);
+      const outAmount = parseOptionalAmount(outRaw);
+      const inAmount = parseOptionalAmount(inRaw);
+      if (Number.isFinite(outAmount)) {
+        signedAmount = outAmount;
+        amountRaw = outRaw;
+        direction = "out";
+      } else if (Number.isFinite(inAmount)) {
+        signedAmount = -inAmount;
+        amountRaw = inRaw;
+        direction = "in";
+      }
     } else if (src === "EPOS") {
       dateRaw = pick(row, ["ご利用日", "利用日", "日付"]);
       merchant = pick(row, ["ご利用店名", "利用店名", "ご利用先", "店名"]);
@@ -273,21 +341,49 @@ const parseCSV = (text, batchId, rules) => {
     }
 
     const date = normalizeDate(dateRaw);
-    const signedAmount = parseAmount(amountRaw);
+    if (signedAmount === undefined) signedAmount = parseAmount(amountRaw);
     if (!date || !Number.isFinite(signedAmount)) {
       errors.push({ row: idx + 2, message: `日付または金額を解析できません`, raw: rawStr });
       return null;
     }
 
-    const type = detectTxnType(merchant, memo, signedAmount);
+    let type = detectTxnType(merchant, memo, signedAmount);
+    let excludedFromStats = type !== "expense";
+    if (src === "PayPay") {
+      const memoText = cleanText(memo);
+      if (direction === "in" && memoText.includes("受け取った金額")) {
+        type = "repayment";
+        excludedFromStats = true;
+      } else if (direction === "in" && memoText.includes("ポイント、残高の獲得")) {
+        type = "excluded";
+        excludedFromStats = true;
+      } else if (direction === "out" && memoText.includes("支払い")) {
+        type = "expense";
+        excludedFromStats = false;
+      } else if (direction === "out" && memoText.includes("送金")) {
+        type = "aa_payment";
+        excludedFromStats = false;
+      } else if (direction === "in") {
+        type = "transfer";
+        excludedFromStats = true;
+      }
+    }
     const txn = {
       id: uid(), date, amount: Math.abs(signedAmount), merchant: cleanText(merchant) || cleanText(memo) || "未記入",
       memo: cleanText(memo), categoryMain: "", categorySub: "",
       paymentMethod: src === "PayPay" ? "PayPay" : src === "EPOS" ? "EPOS" : "Olive",
-      source: src, importBatchId: batchId, raw: rawStr,
-      type, excludedFromStats: type !== "expense",
+      source: src, importBatchId: batchId, raw: rawStr, direction,
+      type, excludedFromStats,
       createdAt: now, updatedAt: now,
     };
+    const settlementType = type === "repayment" ? "repayment" : type === "aa_payment" ? "aa_payment" : "none";
+    Object.assign(txn, normalizeTxnSettlement({
+      ...txn,
+      settlementType,
+      settlementPerson: settlementType === "none" ? "" : txn.merchant,
+      settlementStatus: type === "excluded" ? "ignored" : settlementType === "none" ? "none" : "pending",
+      effectiveAmount: settlementType === "repayment" ? 0 : txn.amount
+    }));
 
     const rule = matchRules(rules, txn);
     if (rule) { txn.categoryMain = rule.catMain; txn.categorySub = rule.catSub; }
@@ -372,12 +468,12 @@ const Range = ({ value, onChange, min, max, step }) => (
 );
 
 const CatPicker = ({ main, sub, onMainChange, onSubChange }) => (
-  <div className="flex gap-2">
-    <div className="flex-1">
+  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+    <div>
       <Select value={main} onChange={v => { onMainChange(v); onSubChange("") }}
         placeholder="大类" options={CAT_KEYS.map(k => ({v:k, l:CATS[k].icon+" "+CATS[k].name}))} />
     </div>
-    <div className="flex-1">
+    <div>
       <Select value={sub} onChange={onSubChange} placeholder="子类"
         options={main && CATS[main] ? CATS[main].subs : []} />
     </div>
@@ -432,7 +528,7 @@ export default function App() {
   // Load
   useEffect(() => {
     (async () => {
-      const t = await db.get("txns"); if (t) setTxns(t);
+      const t = await db.get("txns"); if (t) setTxns(t.map(normalizeTxnSettlement));
       const r = await db.get("rules"); if (r) setRules(r);
       const dm = await db.get("darkMode");
       if (dm) setDarkMode(dm);
@@ -487,28 +583,28 @@ export default function App() {
 
   // Computed
   const monthTxns = useMemo(() => txns.filter(t => getMonth(t.date) === month), [txns, month]);
-  const statsTxns = useMemo(() => monthTxns.filter(t => !t.excludedFromStats && (t.type || "expense") === "expense"), [monthTxns]);
+  const statsTxns = useMemo(() => monthTxns.filter(t => !t.excludedFromStats && statAmount(t) > 0), [monthTxns]);
   const prevMonth = shiftMonth(month, -1);
-  const prevStatsTxns = useMemo(() => txns.filter(t => getMonth(t.date) === prevMonth && !t.excludedFromStats && (t.type || "expense") === "expense"), [txns, prevMonth]);
+  const prevStatsTxns = useMemo(() => txns.filter(t => getMonth(t.date) === prevMonth && !t.excludedFromStats && statAmount(t) > 0), [txns, prevMonth]);
   
-  const totalSpend = useMemo(() => _.sumBy(statsTxns, "amount"), [statsTxns]);
-  const prevTotal = useMemo(() => _.sumBy(prevStatsTxns, "amount"), [prevStatsTxns]);
+  const totalSpend = useMemo(() => _.sumBy(statsTxns, statAmount), [statsTxns]);
+  const prevTotal = useMemo(() => _.sumBy(prevStatsTxns, statAmount), [prevStatsTxns]);
   const daysInMonth = new Date(+month.split("-")[0], +month.split("-")[1], 0).getDate();
   const dailyAvg = Math.round(totalSpend / (daysInMonth || 1));
-  const maxTxn = useMemo(() => _.maxBy(statsTxns, "amount"), [statsTxns]);
+  const maxTxn = useMemo(() => _.maxBy(statsTxns, statAmount), [statsTxns]);
   const uncatCount = useMemo(() => statsTxns.filter(t => !t.categoryMain).length, [statsTxns]);
   const changePercent = prevTotal ? Math.round((totalSpend - prevTotal) / prevTotal * 100) : null;
 
   const catData = useMemo(() => {
     const grouped = _.groupBy(statsTxns.filter(t=>t.categoryMain), "categoryMain");
     return CAT_KEYS.map(k => ({
-      key: k, name: CATS[k].icon+" "+CATS[k].name, value: _.sumBy(grouped[k]||[], "amount"), color: CATS[k].color, count: (grouped[k]||[]).length
+      key: k, name: CATS[k].icon+" "+CATS[k].name, value: _.sumBy(grouped[k]||[], statAmount), color: CATS[k].color, count: (grouped[k]||[]).length
     })).filter(d => d.value > 0).sort((a,b) => b.value - a.value);
   }, [statsTxns]);
 
   const pmData = useMemo(() => {
     const grouped = _.groupBy(statsTxns, "paymentMethod");
-    return PM_LIST.map(pm => ({ name:pm, value: _.sumBy(grouped[pm]||[], "amount"), color: PM_COLORS[pm] })).filter(d=>d.value>0);
+    return PM_LIST.map(pm => ({ name:pm, value: _.sumBy(grouped[pm]||[], statAmount), color: PM_COLORS[pm] })).filter(d=>d.value>0);
   }, [statsTxns]);
 
   const filteredTxns = useMemo(() => {
@@ -524,13 +620,13 @@ export default function App() {
   const groupedTxns = useMemo(() => {
     const groups = _.groupBy(filteredTxns, "date");
     return Object.entries(groups).sort((a,b) => b[0].localeCompare(a[0])).map(([date, items]) => ({
-      date, weekday: weekday(date), total: _.sumBy(items, "amount"), items
+      date, weekday: weekday(date), total: _.sumBy(items.filter(t => !t.excludedFromStats), statAmount), items
     }));
   }, [filteredTxns]);
 
   // Actions
   const updateTxn = (id, patch) => {
-    setTxns(prev => prev.map(t => t.id === id ? {...t, ...patch, updatedAt: new Date().toISOString()} : t));
+    setTxns(prev => prev.map(t => t.id === id ? normalizeTxnSettlement({...t, ...patch, updatedAt: new Date().toISOString()}) : t));
   };
 
   const handleImport = async (file) => {
@@ -552,7 +648,7 @@ export default function App() {
         encoding,
         dateRange: dates.length ? `${fmtDate(dates[0])} ~ ${fmtDate(dates[dates.length-1])}` : "-",
         count: parsed.txns.length,
-        total: _.sumBy(parsed.txns.filter(t => !t.excludedFromStats), "amount"),
+        total: _.sumBy(parsed.txns.filter(t => !t.excludedFromStats), statAmount),
         uncatCount: parsed.txns.filter(t => !t.categoryMain && !t.excludedFromStats).length,
         excludedCount: parsed.txns.filter(t => t.excludedFromStats).length,
         dupeCount: dupes.length,
@@ -586,6 +682,7 @@ export default function App() {
       source: "manual", importBatchId: "", raw: "",
       type: "expense", excludedFromStats: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
+    Object.assign(txn, normalizeTxnSettlement(txn));
     setTxns(prev => [...prev, txn]);
     setMAmt(""); setMMerch(""); setMMemo(""); setMCatM(""); setMCatS("");
   };
@@ -626,7 +723,7 @@ export default function App() {
       if (!source || typeof source !== "object") throw new Error("备份格式不正确");
       if (!confirm("导入备份会覆盖当前账本和外观设置。确定继续？")) return;
       await assetDb.sync(payload.assets || source.assets || []);
-      setTxns(Array.isArray(source.txns) ? source.txns : []);
+      setTxns(Array.isArray(source.txns) ? source.txns.map(normalizeTxnSettlement) : []);
       setRules(Array.isArray(source.rules) ? source.rules : []);
       const ap = source.appearance || {};
       setDarkMode(ap.darkMode || (ap.dark ? "dark" : "light"));
@@ -679,6 +776,44 @@ export default function App() {
     }));
   };
 
+  const confirmSettlementMatch = (repaymentId, advanceId) => {
+    if (!confirm("确认把这笔还款绑定到代付记录？")) return;
+    const now = new Date().toISOString();
+    setTxns(prev => {
+      const repayment = prev.find(t => t.id === repaymentId);
+      if (!repayment) return prev;
+      const repaymentAmount = Math.abs(Number(repayment.originalAmount ?? repayment.amount ?? 0));
+      return prev.map(t => {
+        if (t.id === advanceId) {
+          const originalAmount = Math.abs(Number(t.originalAmount ?? t.amount ?? 0));
+          const offsetAmount = Math.min(originalAmount, Math.max(0, Number(t.offsetAmount || 0)) + repaymentAmount);
+          return normalizeTxnSettlement({
+            ...t,
+            settlementType: "advance",
+            originalAmount,
+            offsetAmount,
+            effectiveAmount: Math.max(0, originalAmount - offsetAmount),
+            settlementStatus: "matched",
+            updatedAt: now
+          });
+        }
+        if (t.id === repaymentId) {
+          return normalizeTxnSettlement({
+            ...t,
+            settlementType: "repayment",
+            linkedTransactionId: advanceId,
+            effectiveAmount: 0,
+            excludedFromStats: true,
+            settlementStatus: "matched",
+            updatedAt: now
+          });
+        }
+        return t;
+      });
+    });
+    setEditId(null);
+  };
+
   // CSS Variables
   const dark = darkMode === "dark" || (darkMode === "auto" && systemDark);
   const [ar, ag, ab] = hexToRgb(themeColor);
@@ -696,6 +831,19 @@ export default function App() {
   const bgImageStyle = bgUrl ? `url("${bgUrl}")` : bgImageData ? `url("${bgImageData}")` : "none";
 
   const editTxn = editId ? txns.find(t=>t.id===editId) : null;
+  const settlementCandidates = useMemo(() => {
+    if (!editTxn || editTxn.settlementType !== "repayment") return [];
+    const repaymentDate = new Date(editTxn.date);
+    const person = cleanText(editTxn.settlementPerson || editTxn.merchant);
+    return _.orderBy(txns.filter(t => {
+      if (t.id === editTxn.id || t.settlementType !== "advance") return false;
+      if (statAmount(t) <= 0) return false;
+      const diff = Math.round((repaymentDate - new Date(t.date)) / 86400000);
+      if (diff < 0 || diff > 14) return false;
+      const otherPerson = cleanText(t.settlementPerson || t.merchant);
+      return !person || !otherPerson || person === otherPerson;
+    }), ["date","createdAt"], ["desc","desc"]).slice(0, 6);
+  }, [editTxn, txns]);
   
   const recentManual = useMemo(() =>
     txns.filter(t=>t.source==="manual").sort((a,b)=>b.createdAt.localeCompare(a.createdAt)).slice(0,5)
@@ -754,7 +902,7 @@ export default function App() {
               {[
                 { label:"总支出", value: fmtAmt(totalSpend), sub: changePercent !== null ? `${changePercent > 0 ? "↑":"↓"}${Math.abs(changePercent)}% 环比` : "—" },
                 { label:"日均", value: fmtAmt(dailyAvg) },
-                { label:"最大单笔", value: maxTxn ? fmtAmt(maxTxn.amount) : "—", sub: maxTxn?.merchant?.slice(0,10) },
+                { label:"最大单笔", value: maxTxn ? fmtAmt(statAmount(maxTxn)) : "—", sub: maxTxn?.merchant?.slice(0,10) },
                 { label:"未分类", value: uncatCount+"笔", sub: uncatCount > 0 ? "需要归类" : "全部已分类", alert: uncatCount > 0 },
               ].map((c,i) => (
                 <div key={i} className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}
@@ -813,9 +961,9 @@ export default function App() {
                   const subs = statsTxns.filter(t=>t.categoryMain===drillCat);
                   const subGroups = _.groupBy(subs, t=>t.categorySub||"未分類");
                   const subData = Object.entries(subGroups).map(([name,items])=>({
-                    name, value:_.sumBy(items,"amount"), count:items.length
+                    name, value:_.sumBy(items, statAmount), count:items.length
                   })).sort((a,b)=>b.value-a.value);
-                  const catTotal = _.sumBy(subs,"amount");
+                  const catTotal = _.sumBy(subs, statAmount);
                   return (
                     <div className="space-y-2">
                       <div className="text-xl font-bold mb-2">{fmtAmt(catTotal)}</div>
@@ -909,8 +1057,11 @@ export default function App() {
                         </div>
                       </div>
                       <div className="text-right shrink-0">
-                        <div className="text-sm font-semibold">-{fmtAmt(t.amount)}</div>
+                        <div className="text-sm font-semibold">-{fmtAmt(t.excludedFromStats && statAmount(t) === 0 ? t.amount : statAmount(t))}</div>
                         <div className="text-xs mt-0.5" style={{color:PM_COLORS[t.paymentMethod]||"var(--text3)"}}>{t.paymentMethod}</div>
+                        {t.settlementType !== "none" && (
+                          <div className="text-[10px] mt-0.5" style={{color:"var(--accent)"}}>{settlementLabel[t.settlementType]}</div>
+                        )}
                       </div>
                     </div>
                   ))}
@@ -926,9 +1077,9 @@ export default function App() {
           <div className="space-y-4 pt-2">
             <div className="rounded-2xl p-4 space-y-3" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
               <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>现金补录</div>
-              <div className="flex gap-2">
-                <div className="flex-1"><Input type="date" value={mDate} onChange={setMDate} /></div>
-                <div className="flex-1"><Input type="number" value={mAmt} onChange={setMAmt} placeholder="金额" /></div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div><Input type="date" value={mDate} onChange={setMDate} /></div>
+                <div><Input type="number" value={mAmt} onChange={setMAmt} placeholder="金额" /></div>
               </div>
               <Input value={mMerch} onChange={setMMerch} placeholder="商户名" />
               <Input value={mMemo} onChange={setMMemo} placeholder="备注（可选）" />
@@ -1181,6 +1332,8 @@ export default function App() {
       {/* Transaction Edit */}
       <Modal open={!!editTxn} onClose={()=>setEditId(null)} title="编辑交易">
         {editTxn && <TxnEditor txn={editTxn} onSave={(id,patch)=>{updateTxn(id,patch);setEditId(null)}}
+          settlementCandidates={settlementCandidates}
+          onConfirmSettlement={confirmSettlementMatch}
           onCreateRule={(kw,catM,catS)=>setRuleEdit({keyword:kw,matchType:"contains",catMain:catM,catSub:catS,pmCondition:"",priority:10,enabled:true})}
           onDelete={()=>{setTxns(prev=>prev.filter(t=>t.id!==editId));setEditId(null)}} />}
       </Modal>
@@ -1197,17 +1350,33 @@ export default function App() {
    7. EDITOR COMPONENTS
    ═══════════════════════════════════════════ */
 
-function TxnEditor({ txn, onSave, onCreateRule, onDelete }) {
+function TxnEditor({ txn, onSave, onCreateRule, onDelete, settlementCandidates = [], onConfirmSettlement }) {
   const [merchant, setMerchant] = useState(txn.merchant);
   const [memo, setMemo] = useState(txn.memo);
   const [catM, setCatM] = useState(txn.categoryMain);
   const [catS, setCatS] = useState(txn.categorySub);
   const [pm, setPm] = useState(txn.paymentMethod);
   const [excl, setExcl] = useState(txn.excludedFromStats);
+  const [settlementType, setSettlementType] = useState(txn.settlementType || "none");
+  const [settlementPerson, setSettlementPerson] = useState(txn.settlementPerson || "");
   const [askRule, setAskRule] = useState(false);
+  const originalAmount = Math.abs(Number(txn.originalAmount ?? txn.amount ?? 0));
+  const offsetAmount = Math.max(0, Number(txn.offsetAmount ?? 0));
+  const effectiveAmount = settlementType === "repayment" ? 0 : Math.max(0, originalAmount - offsetAmount);
 
   const save = () => {
-    onSave(txn.id, { merchant, memo, categoryMain:catM, categorySub:catS, paymentMethod:pm, excludedFromStats:excl });
+    const nextExcluded = settlementType === "repayment" ? true : excl;
+    onSave(txn.id, {
+      merchant, memo, categoryMain:catM, categorySub:catS, paymentMethod:pm,
+      excludedFromStats:nextExcluded,
+      type: settlementType === "repayment" ? "repayment" : settlementType === "aa_payment" ? "aa_payment" : "expense",
+      settlementType,
+      settlementPerson: cleanText(settlementPerson),
+      originalAmount,
+      offsetAmount,
+      effectiveAmount: settlementType === "none" || settlementType === "aa_payment" ? originalAmount : effectiveAmount,
+      settlementStatus: settlementType === "none" ? "none" : txn.settlementStatus === "matched" ? "matched" : "pending"
+    });
     if (askRule && merchant && catM) onCreateRule(merchant, catM, catS);
   };
 
@@ -1215,12 +1384,52 @@ function TxnEditor({ txn, onSave, onCreateRule, onDelete }) {
     <div className="space-y-3">
       <div className="flex justify-between text-xs" style={{color:"var(--text3)"}}>
         <span>{txn.date} · {txn.source}</span>
-        <span className="text-lg font-bold" style={{color:"var(--text)"}}>-{fmtAmt(txn.amount)}</span>
+        <span className="text-lg font-bold" style={{color:"var(--text)"}}>-{fmtAmt(statAmount(txn))}</span>
       </div>
       <Input value={merchant} onChange={setMerchant} placeholder="商户名" />
       <Input value={memo} onChange={setMemo} placeholder="备注" />
       <CatPicker main={catM} sub={catS} onMainChange={setCatM} onSubChange={setCatS} />
       <Select value={pm} onChange={setPm} placeholder="支付方式" options={PM_LIST} />
+      <div className="rounded-xl p-3 space-y-2" style={{background:"var(--input)",border:"1px solid var(--border)"}}>
+        <div className="grid grid-cols-3 gap-2 text-center">
+          <div>
+            <div className="text-[10px]" style={{color:"var(--text3)"}}>原始金额</div>
+            <div className="text-sm font-semibold">{fmtAmt(originalAmount)}</div>
+          </div>
+          <div>
+            <div className="text-[10px]" style={{color:"var(--text3)"}}>已抵消</div>
+            <div className="text-sm font-semibold">{fmtAmt(offsetAmount)}</div>
+          </div>
+          <div>
+            <div className="text-[10px]" style={{color:"var(--text3)"}}>实际支出</div>
+            <div className="text-sm font-semibold">{fmtAmt(settlementType === "repayment" ? 0 : effectiveAmount)}</div>
+          </div>
+        </div>
+        <Select value={settlementType} onChange={setSettlementType} options={[
+          {v:"none",l:"普通消费"},
+          {v:"advance",l:"我先代付"},
+          {v:"repayment",l:"对方还款"},
+          {v:"aa_payment",l:"我付 AA 款"}
+        ]} />
+        <Input value={settlementPerson} onChange={setSettlementPerson} placeholder="结算对象（可选）" />
+        <div className="flex justify-between text-xs" style={{color:"var(--text3)"}}>
+          <span>{settlementLabel[settlementType]} · {statusLabel[txn.settlementStatus || "none"]}</span>
+          {txn.linkedTransactionId && <span>已关联还款记录</span>}
+        </div>
+      </div>
+      {txn.settlementType === "repayment" && txn.settlementStatus !== "matched" && (
+        <div className="rounded-xl p-3 space-y-2" style={{background:"rgba(var(--accent-rgb),0.08)",border:"1px solid rgba(var(--accent-rgb),0.2)"}}>
+          <div className="text-xs font-medium" style={{color:"var(--accent)"}}>可绑定的最近代付</div>
+          {settlementCandidates.length ? settlementCandidates.map(c => (
+            <button key={c.id} onClick={()=>onConfirmSettlement?.(txn.id, c.id)}
+              className="w-full text-left rounded-lg px-3 py-2 text-xs"
+              style={{background:"var(--card)",border:"1px solid var(--border)",color:"var(--text)"}}>
+              <div className="font-medium">{fmtDate(c.date)} · {c.merchant}</div>
+              <div style={{color:"var(--text3)"}}>剩余 {fmtAmt(statAmount(c))} / 原始 {fmtAmt(c.originalAmount ?? c.amount)}</div>
+            </button>
+          )) : <div className="text-xs" style={{color:"var(--text3)"}}>最近 14 天没有可匹配的代付记录</div>}
+        </div>
+      )}
       <div className="flex items-center justify-between py-1">
         <span className="text-sm">排除统计</span>
         <button onClick={()=>setExcl(!excl)} className="w-10 h-6 rounded-full relative transition-colors"
