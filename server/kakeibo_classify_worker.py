@@ -24,7 +24,8 @@ from typing import Any
 
 DB_PATH = Path(os.environ.get("KAKEIBO_DB", "/opt/codex-tg/kakeibo.sqlite3"))
 CODEX_CLI = os.environ.get("KAKEIBO_CODEX_CLI", "codex")
-MODEL = os.environ.get("KAKEIBO_CLASSIFY_MODEL", "gpt-5.4-medium")
+MODEL = os.environ.get("KAKEIBO_CLASSIFY_MODEL", "gpt-5.5")
+REASONING = os.environ.get("KAKEIBO_CLASSIFY_REASONING", "medium")
 DRY_RUN = os.environ.get("KAKEIBO_CLASSIFY_DRY_RUN", "0") == "1"
 TIMEOUT = int(os.environ.get("KAKEIBO_CLASSIFY_TIMEOUT", "90"))
 
@@ -246,7 +247,13 @@ def run_codex(task: dict[str, Any]) -> dict[str, Any]:
     else:
         with tempfile.NamedTemporaryFile("r+", encoding="utf-8", delete=False) as tmp:
             output_path = tmp.name
-        command = cmd + ["exec", "--skip-git-repo-check", "--model", MODEL, "--output-last-message", output_path]
+        command = cmd + [
+            "exec",
+            "--skip-git-repo-check",
+            "--model", MODEL,
+            "-c", f'model_reasoning_effort="{REASONING}"',
+            "--output-last-message", output_path,
+        ]
         proc = subprocess.run(command, input=prompt, text=True, capture_output=True, timeout=TIMEOUT)
         if proc.returncode == 0:
             try:
@@ -333,8 +340,15 @@ def run_one(task_id: str | None = None) -> int:
     except Exception as exc:
         with db() as conn:
             task["rawError"] = str(exc)
-            update_task(conn, task, "failed", str(exc)[:4000])
+            update_task(conn, task, "failed", compact_error(str(exc)))
         return 1
+
+
+def compact_error(message: str, limit: int = 4000) -> str:
+    if len(message) <= limit:
+        return message
+    half = max(500, limit // 2 - 40)
+    return message[:half] + "\n...\n" + message[-half:]
 
 
 if __name__ == "__main__":
