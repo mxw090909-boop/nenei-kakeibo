@@ -149,6 +149,9 @@ const mergeByUpdatedAt = (localItems = [], remoteItems = [], normalizer = x => x
   return Array.from(map.values()).filter(item => !item.deletedAt).map(normalizer);
 };
 
+const mergeSuggestedRules = (localItems = [], remoteItems = []) =>
+  mergeByUpdatedAt(localItems, remoteItems).filter(r => !r.deletedAt && r.status !== "accepted" && r.status !== "rejected");
+
 const pullFromVps = (config, since = "") =>
   syncFetch(config, `/api/kakeibo/sync/pull?since=${encodeURIComponent(since || "")}`);
 
@@ -1051,7 +1054,7 @@ export default function App() {
       setTxns(prev => mergeByUpdatedAt(prev, remoteTxns, normalizeTxnSettlement).filter(t => !deletedTxnIds.has(t.id)));
       setRules(prev => mergeByUpdatedAt(prev, remoteRules, normalizeRule).filter(r => !deletedRuleIds.has(r.id)));
       applyRemoteSettings(pulled.settings);
-      if (Array.isArray(pulled.suggestedRules)) setSuggestedRules(pulled.suggestedRules.filter(r => !r.deletedAt && r.status !== "accepted"));
+      if (Array.isArray(pulled.suggestedRules)) setSuggestedRules(prev => mergeSuggestedRules(prev, pulled.suggestedRules));
       const serverTime = pulled.serverTime || new Date().toISOString();
       setLastPulledAt(serverTime);
       setLastSyncAt(new Date().toISOString());
@@ -1117,7 +1120,7 @@ export default function App() {
       setClassifyError("");
       const task = await fetchClassifyTask({ url:syncUrl, token:syncToken }, classifyTask.id);
       setClassifyTask(task);
-      if (Array.isArray(task.suggestedRules)) setSuggestedRules(task.suggestedRules.filter(r => r.status !== "accepted"));
+      if (Array.isArray(task.suggestedRules)) setSuggestedRules(task.suggestedRules.filter(r => !r.deletedAt && r.status !== "accepted" && r.status !== "rejected"));
       setClassifyStatus(task.status || "idle");
       await loadClassifySummary();
     } catch (e) {
@@ -1147,6 +1150,11 @@ export default function App() {
       setSuggestedRules(prev => prev.filter(r => !acceptedIds.includes(r.id) && !rejectedIds.includes(r.id) && !editedRules.some(e => e.suggestedRuleId === r.id)));
       await applyCloudRules({ url:syncUrl, token:syncToken }, { force:false });
       await runSync({ pushFirst:false, silent:true });
+      if (classifyTask?.id) {
+        const task = await fetchClassifyTask({ url:syncUrl, token:syncToken }, classifyTask.id);
+        setClassifyTask(task);
+        if (Array.isArray(task.suggestedRules)) setSuggestedRules(task.suggestedRules.filter(r => !r.deletedAt && r.status !== "accepted" && r.status !== "rejected"));
+      }
       await loadClassifySummary();
       setClassifyStatus("synced");
     } catch (e) {
