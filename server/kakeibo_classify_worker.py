@@ -15,6 +15,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -243,8 +244,16 @@ def run_codex(task: dict[str, Any]) -> dict[str, Any]:
         command = CODEX_CLI.format(model=MODEL, prompt=shlex.quote(prompt))
         proc = subprocess.run(command, shell=True, text=True, capture_output=True, timeout=TIMEOUT)
     else:
-        command = cmd + ["exec", "--model", MODEL]
+        with tempfile.NamedTemporaryFile("r+", encoding="utf-8", delete=False) as tmp:
+            output_path = tmp.name
+        command = cmd + ["exec", "--skip-git-repo-check", "--model", MODEL, "--output-last-message", output_path]
         proc = subprocess.run(command, input=prompt, text=True, capture_output=True, timeout=TIMEOUT)
+        if proc.returncode == 0:
+            try:
+                stdout = Path(output_path).read_text(encoding="utf-8")
+            finally:
+                Path(output_path).unlink(missing_ok=True)
+            return parse_json_output(stdout)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"Codex exited {proc.returncode}")
     return parse_json_output(proc.stdout)
