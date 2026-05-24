@@ -380,6 +380,13 @@ const parseOptionalAmount = value => {
   return parseAmount(raw);
 };
 
+const cleanSmbcDescription = value => {
+  const raw = cleanText(value).replace(/\u3000/g, " ").replace(/\s+/g, " ");
+  const withoutVisaId = raw.replace(/^V[0-9０-９]{6}\s+/, "").trim();
+  if (withoutVisaId !== raw) return withoutVisaId;
+  return raw.replace(/^V[ァ-ヶｦ-ﾟー]+[0-9０-９]+\s*/, "").trim();
+};
+
 const normalizeDate = value => {
   let raw = String(value ?? "").trim();
   if (!raw) return "";
@@ -554,8 +561,10 @@ const parseCSV = (text, batchId, rules) => {
       memo = pick(row, ["備考", "支払区分", "メモ"]);
     } else if (src === "SMBC") {
       dateRaw = pick(row, ["年月日", "日付", "取引日", "利用日"]);
-      merchant = pick(row, ["お取り扱い内容", "お取扱内容", "お取引内容", "摘要", "内容"]);
-      memo = pick(row, ["メモ", "ラベル", "お取り扱い内容", "摘要", "内容"]);
+      const contentRaw = pick(row, ["お取り扱い内容", "お取扱内容", "お取引内容", "摘要", "内容"]);
+      const memoRaw = pick(row, ["メモ", "ラベル"]);
+      merchant = cleanSmbcDescription(contentRaw);
+      memo = cleanSmbcDescription(memoRaw || contentRaw);
       const outRaw = pick(row, ["お引出し", "出金額", "出金", "支払金額", "金額"]);
       const inRaw = pick(row, ["お預入れ", "入金額", "入金", "受取金額"]);
       const outAmount = parseOptionalAmount(outRaw);
@@ -652,6 +661,19 @@ const parseCSV = (text, batchId, rules) => {
       ) {
         txn.categoryMain = "food";
         txn.categorySub = "スーパー";
+      } else if (
+        !txn.categoryMain &&
+        (
+          bankText.includes("セブン") ||
+          bankText.includes("７－１１") ||
+          bankText.includes("ローソン") ||
+          bankText.includes("ファミリ") ||
+          bankText.includes("フアミリ") ||
+          bankText.includes("デイリーヤマザキ")
+        )
+      ) {
+        txn.categoryMain = "food";
+        txn.categorySub = "コンビニ";
       }
     }
     return txn;
