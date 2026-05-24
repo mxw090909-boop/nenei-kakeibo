@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { Component, useState, useEffect, useMemo } from "react";
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
 import Papa from "papaparse";
 import _ from "lodash";
@@ -152,6 +152,22 @@ const mergeByUpdatedAt = (localItems = [], remoteItems = [], normalizer = x => x
 const mergeSuggestedRules = (localItems = [], remoteItems = []) =>
   mergeByUpdatedAt(localItems, remoteItems).filter(r => !r.deletedAt && r.status !== "accepted" && r.status !== "rejected");
 
+const makeSuggestedRuleDraft = suggestion => ({
+  keyword: suggestion?.keyword || suggestion?.merchant || "",
+  matchType: suggestion?.matchType || "contains",
+  ruleType: suggestion?.ruleType || "category",
+  categoryMain: suggestion?.categoryMain || suggestion?.catMain || "",
+  categorySub: suggestion?.categorySub || suggestion?.catSub || "",
+  settlementPerson: suggestion?.settlementPerson || suggestion?.keyword || "",
+  settlementTypeHint: suggestion?.settlementTypeHint || "repayment",
+  priority: String(suggestion?.priority || 50)
+});
+
+const isSuggestedRuleDraftDirty = (suggestion, draft) => {
+  const original = makeSuggestedRuleDraft(suggestion);
+  return Object.keys(original).some(key => String(original[key] ?? "") !== String(draft?.[key] ?? ""));
+};
+
 const pullFromVps = (config, since = "") =>
   syncFetch(config, `/api/kakeibo/sync/pull?since=${encodeURIComponent(since || "")}`);
 
@@ -175,6 +191,22 @@ const confirmSuggestedRules = (config, payload) =>
 
 const applyCloudRules = (config, payload = {}) =>
   syncFetch(config, "/api/kakeibo/rules/apply", { method:"POST", body:JSON.stringify(payload) });
+
+class ModalErrorBoundary extends Component {
+  state = { error: null };
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidUpdate(prevProps) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.error) this.setState({ error:null });
+  }
+  render() {
+    if (this.state.error) {
+      return <div className="text-sm rounded-xl p-4" style={{background:"var(--input)",color:"#c44"}}>
+        弹窗内容加载失败：{this.state.error.message || "未知错误"}
+      </div>;
+    }
+    return this.props.children;
+  }
+}
 
 const collectUnknownMerchants = (transactions = []) => {
   const grouped = _.groupBy(
@@ -656,6 +688,7 @@ export default function App() {
   const [classifyStatus, setClassifyStatus] = useState("idle");
   const [classifyError, setClassifyError] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [suggestionDrafts, setSuggestionDrafts] = useState({});
   
   // Modals
   const [editId, setEditId] = useState(null);
@@ -1148,6 +1181,12 @@ export default function App() {
       const result = await confirmSuggestedRules({ url:syncUrl, token:syncToken }, { acceptedIds, rejectedIds, editedRules });
       if (Array.isArray(result.rules)) setRules(prev => mergeByUpdatedAt(prev, result.rules, normalizeRule));
       setSuggestedRules(prev => prev.filter(r => !acceptedIds.includes(r.id) && !rejectedIds.includes(r.id) && !editedRules.some(e => e.suggestedRuleId === r.id)));
+      const finishedIds = new Set([...acceptedIds, ...rejectedIds, ...editedRules.map(e => e.suggestedRuleId).filter(Boolean)]);
+      setSuggestionDrafts(prev => {
+        const next = { ...prev };
+        finishedIds.forEach(id => delete next[id]);
+        return next;
+      });
       await applyCloudRules({ url:syncUrl, token:syncToken }, { force:false });
       await runSync({ pushFirst:false, silent:true });
       await loadClassifySummary();
@@ -1789,18 +1828,25 @@ export default function App() {
 
       {/* Suggested Rules */}
       <Modal open={showSuggestions} onClose={()=>setShowSuggestions(false)} title="分类建议">
-        <div className="space-y-3">
-          {suggestedRules.length === 0 && <div className="text-sm text-center py-8" style={{color:"var(--text3)"}}>暂无待确认建议</div>}
-          {suggestedRules.map(s => (
-            <SuggestedRuleEditor
-              key={s.id}
-              suggestion={s}
-              onAccept={acceptSuggestedRule}
-              onEditAccept={editAndAcceptSuggestedRule}
-              onReject={rejectSuggestedRule}
-            />
-          ))}
-        </div>
+        <ModalErrorBoundary resetKey={`${showSuggestions}-${suggestedRules.length}`}>
+          <div className="space-y-3">
+            {suggestedRules.length === 0 && <div className="text-sm text-center py-8" style={{color:"var(--text3)"}}>暂无待确认建议</div>}
+            {suggestedRules.filter(s => s?.id).map(s => (
+              <SuggestedRuleEditor
+                key={s.id}
+                suggestion={s}
+                draft={suggestionDrafts[s.id] || makeSuggestedRuleDraft(s)}
+                onDraftChange={patch => setSuggestionDrafts(prev => ({
+                  ...prev,
+                  [s.id]: { ...makeSuggestedRuleDraft(s), ...(prev[s.id] || {}), ...patch }
+                }))}
+                onAccept={acceptSuggestedRule}
+                onEditAccept={editAndAcceptSuggestedRule}
+                onReject={rejectSuggestedRule}
+              />
+            ))}
+          </div>
+        </ModalErrorBoundary>
       </Modal>
 
       {/* Rule Edit */}
@@ -1815,28 +1861,15 @@ export default function App() {
    7. EDITOR COMPONENTS
    ═══════════════════════════════════════════ */
 
-function SuggestedRuleEditor({ suggestion, onAccept, onEditAccept, onReject }) {
-  const initialMain = suggestion.categoryMain || suggestion.catMain || "";
-  const initialSub = suggestion.categorySub || suggestion.catSub || "";
-  const initialRuleType = suggestion.ruleType || "category";
-  const [keyword, setKeyword] = useState(suggestion.keyword || suggestion.merchant || "");
-  const [matchType, setMatchType] = useState(suggestion.matchType || "contains");
-  const [ruleType, setRuleType] = useState(initialRuleType);
-  const [categoryMain, setCategoryMain] = useState(initialMain);
-  const [categorySub, setCategorySub] = useState(initialSub);
-  const [settlementPerson, setSettlementPerson] = useState(suggestion.settlementPerson || suggestion.keyword || "");
-  const [settlementTypeHint, setSettlementTypeHint] = useState(suggestion.settlementTypeHint || "repayment");
-  const [priority, setPriority] = useState(String(suggestion.priority || 50));
+function SuggestedRuleEditor({ suggestion, draft, onDraftChange, onAccept, onEditAccept, onReject }) {
+  if (!suggestion?.id) return null;
+  const current = draft || makeSuggestedRuleDraft(suggestion);
+  const {
+    keyword, matchType, ruleType, categoryMain, categorySub,
+    settlementPerson, settlementTypeHint, priority
+  } = current;
   const confidence = Math.round(Number(suggestion.confidence || 0) * 100);
-  const isDirty =
-    keyword !== (suggestion.keyword || suggestion.merchant || "") ||
-    matchType !== (suggestion.matchType || "contains") ||
-    ruleType !== initialRuleType ||
-    categoryMain !== initialMain ||
-    categorySub !== initialSub ||
-    settlementPerson !== (suggestion.settlementPerson || suggestion.keyword || "") ||
-    settlementTypeHint !== (suggestion.settlementTypeHint || "repayment") ||
-    Number(priority || 0) !== Number(suggestion.priority || 50);
+  const isDirty = isSuggestedRuleDraftDirty(suggestion, current);
 
   const accept = () => {
     if (!isDirty) {
@@ -1868,24 +1901,29 @@ function SuggestedRuleEditor({ suggestion, onAccept, onEditAccept, onReject }) {
       {suggestion.reason && <div className="text-xs" style={{color:"var(--text2)"}}>{suggestion.reason}</div>}
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-        <Input value={keyword} onChange={setKeyword} placeholder="关键词" />
-        <Select value={matchType} onChange={setMatchType} options={[{v:"contains",l:"包含匹配"},{v:"exact",l:"完全一致"}]} />
-        <Select value={ruleType} onChange={setRuleType} options={[
+        <Input value={keyword} onChange={value => onDraftChange({ keyword:value })} placeholder="关键词" />
+        <Select value={matchType} onChange={value => onDraftChange({ matchType:value })} options={[{v:"contains",l:"包含匹配"},{v:"exact",l:"完全一致"}]} />
+        <Select value={ruleType} onChange={value => onDraftChange({ ruleType:value })} options={[
           {v:"category",l:"分类规则"},
           {v:"settlement_person",l:"AA/还款对象"},
           {v:"exclude",l:"排除统计"}
         ]} />
-        <Input type="number" value={priority} onChange={setPriority} placeholder="优先级" />
+        <Input type="number" value={priority} onChange={value => onDraftChange({ priority:value })} placeholder="优先级" />
       </div>
 
       {ruleType === "category" && (
-        <CatSelect main={categoryMain} sub={categorySub} onMainChange={setCategoryMain} onSubChange={setCategorySub} />
+        <CatSelect
+          main={categoryMain}
+          sub={categorySub}
+          onMainChange={value => onDraftChange({ categoryMain:value, categorySub:"" })}
+          onSubChange={value => onDraftChange({ categorySub:value })}
+        />
       )}
 
       {ruleType === "settlement_person" && (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          <Input value={settlementPerson} onChange={setSettlementPerson} placeholder="结算对象名" />
-          <Select value={settlementTypeHint} onChange={setSettlementTypeHint} options={[
+          <Input value={settlementPerson} onChange={value => onDraftChange({ settlementPerson:value })} placeholder="结算对象名" />
+          <Select value={settlementTypeHint} onChange={value => onDraftChange({ settlementTypeHint:value })} options={[
             {v:"repayment",l:"对方还我"},
             {v:"aa_payment",l:"我付 AA 款"}
           ]} />
