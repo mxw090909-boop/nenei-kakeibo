@@ -7,20 +7,28 @@ import _ from "lodash";
    1. CONSTANTS
    ═══════════════════════════════════════════ */
 
-const CATS = {
-  food:    { name:"吃喝", icon:"🍜", color:"#e8985a", subs:["外食","コンビニ","スーパー","カフェ","デリバリー"] },
-  transit: { name:"交通", icon:"🚃", color:"#6aabcf", subs:["電車・バス","タクシー","自転車","飛行機"] },
-  housing: { name:"住居", icon:"🏠", color:"#7dab7d", subs:["家賃","光熱費","通信費","家具・家電"] },
-  daily:   { name:"日用品", icon:"🧴", color:"#c9a84c", subs:["消耗品","洗濯・掃除","キッチン"] },
-  medical: { name:"医疗", icon:"💊", color:"#d48ba6", subs:["病院","薬局","健康診断"] },
-  travel:  { name:"旅行", icon:"✈️", color:"#5aafa8", subs:["宿泊","交通費","食費","アクティビティ","お土産"] },
-  fashion: { name:"服饰美容", icon:"👗", color:"#a494c8", subs:["衣服","靴・バッグ","美容院","コスメ"] },
-  fun:     { name:"娱乐", icon:"🎮", color:"#cf7563", subs:["書籍","映画・音楽","ゲーム","趣味"] },
-  social:  { name:"社交", icon:"🥂", color:"#c47a82", subs:["飲み会","プレゼント","冠婚葬祭"] },
-  admin:   { name:"行政", icon:"📋", color:"#8a95a3", subs:["税金","保険","手数料","ビザ・在留"] },
-  other:   { name:"其他", icon:"📦", color:"#a39b91", subs:["未分類","雑費","ATM手数料"] },
-};
-const CAT_KEYS = Object.keys(CATS);
+const DEFAULT_CATEGORIES = [
+  { id:"food", key:"food", name:"吃喝", icon:"🍜", color:"#e8985a", subs:["外食","コンビニ","スーパー","カフェ","デリバリー"], sort:10, enabled:true },
+  { id:"transit", key:"transit", name:"交通", icon:"🚃", color:"#6aabcf", subs:["電車・バス","タクシー","自転車","飛行機"], sort:20, enabled:true },
+  { id:"housing", key:"housing", name:"住居", icon:"🏠", color:"#7dab7d", subs:["家賃","光熱費","水道","電気","ガス","通信費","家具・家電"], sort:30, enabled:true },
+  { id:"daily", key:"daily", name:"日用品", icon:"🧴", color:"#c9a84c", subs:["消耗品","洗濯・掃除","キッチン"], sort:40, enabled:true },
+  { id:"medical", key:"medical", name:"医疗", icon:"💊", color:"#d48ba6", subs:["病院","薬局","健康診断"], sort:50, enabled:true },
+  { id:"travel", key:"travel", name:"旅行", icon:"✈️", color:"#5aafa8", subs:["宿泊","交通費","食費","アクティビティ","お土産"], sort:60, enabled:true },
+  { id:"fashion", key:"fashion", name:"服饰美容", icon:"👗", color:"#a494c8", subs:["衣服","靴・バッグ","美容院","コスメ"], sort:70, enabled:true },
+  { id:"fun", key:"fun", name:"娱乐", icon:"🎮", color:"#cf7563", subs:["書籍","映画・音楽","ゲーム","趣味"], sort:80, enabled:true },
+  { id:"social", key:"social", name:"社交", icon:"🥂", color:"#c47a82", subs:["飲み会","プレゼント","冠婚葬祭"], sort:90, enabled:true },
+  { id:"admin", key:"admin", name:"行政", icon:"📋", color:"#8a95a3", subs:["税金","保険","手数料","ビザ・在留"], sort:100, enabled:true },
+  { id:"other", key:"other", name:"其他", icon:"📦", color:"#a39b91", subs:["未分類","雑費","ATM手数料"], sort:110, enabled:true },
+];
+const defaultCategories = () => DEFAULT_CATEGORIES.map((c, i) => ({
+  ...c,
+  createdAt: c.createdAt || new Date(0).toISOString(),
+  updatedAt: c.updatedAt || new Date(0).toISOString(),
+  deletedAt: null,
+  serverVersion: 0,
+  sort: c.sort ?? (i + 1) * 10
+}));
+const DEFAULT_CAT_MAP = Object.fromEntries(defaultCategories().map(c => [c.key, c]));
 const PM_LIST = ["Olive","EPOS","PayPay","現金"];
 const PM_COLORS = { Olive:"#4a9c6d", EPOS:"#7c5cbf", PayPay:"#e44e4e", "現金":"#c9a84c" };
 const THEME_PRESETS = ["#d4736b", "#4a9c6d", "#6aabcf", "#7c5cbf", "#5aafa8", "#c9a84c"];
@@ -108,6 +116,7 @@ const syncFetch = async (config, path, options = {}) => {
 const loadLocalCache = async () => ({
   transactions: (await db.get("txns")) || [],
   rules: (await db.get("rules")) || [],
+  categories: (await db.get("categories")) || [],
   settings: {
     darkMode: await db.get("darkMode"),
     themeColor: await db.get("themeColor"),
@@ -121,9 +130,10 @@ const loadLocalCache = async () => ({
   lastPulledAt: await db.get("syncLastPulledAt")
 });
 
-const saveLocalCache = async ({ transactions, rules, settings = {} }) => {
+const saveLocalCache = async ({ transactions, rules, categories, settings = {} }) => {
   if (transactions) await db.set("txns", transactions);
   if (rules) await db.set("rules", rules);
+  if (categories) await db.set("categories", categories);
   await Promise.all(Object.entries(settings).filter(([,v]) => v !== undefined && v !== null).map(([k,v]) => db.set(k, v)));
 };
 
@@ -151,6 +161,32 @@ const mergeByUpdatedAt = (localItems = [], remoteItems = [], normalizer = x => x
 
 const mergeSuggestedRules = (localItems = [], remoteItems = []) =>
   mergeByUpdatedAt(localItems, remoteItems).filter(r => !r.deletedAt && r.status !== "accepted" && r.status !== "rejected");
+
+const normalizeCategory = (cat = {}, idx = 0) => {
+  const key = cleanText(cat.key || cat.id || `category_${idx + 1}`);
+  const fallback = DEFAULT_CAT_MAP[key] || {};
+  return {
+    id: cat.id || key,
+    key,
+    name: cleanText(cat.name || fallback.name || key),
+    icon: cleanText(cat.icon || fallback.icon || "🏷️"),
+    color: cleanText(cat.color || fallback.color || "#999999"),
+    subs: _.uniq((Array.isArray(cat.subs) ? cat.subs : fallback.subs || []).map(s => cleanText(typeof s === "string" ? s : s?.name)).filter(Boolean)),
+    sort: Number.isFinite(Number(cat.sort)) ? Number(cat.sort) : (fallback.sort ?? (idx + 1) * 10),
+    enabled: cat.enabled !== false,
+    createdAt: cat.createdAt || new Date().toISOString(),
+    updatedAt: cat.updatedAt || cat.createdAt || new Date().toISOString(),
+    deletedAt: cat.deletedAt || null,
+    serverVersion: cat.serverVersion || 0,
+    pendingSync: !!cat.pendingSync,
+    syncedAt: cat.syncedAt || ""
+  };
+};
+
+const mergeCategories = (localItems = [], remoteItems = []) => {
+  const merged = mergeByUpdatedAt(localItems, remoteItems, normalizeCategory);
+  return _.orderBy(merged.length ? merged : defaultCategories(), ["sort", "name"], ["asc", "asc"]);
+};
 
 const makeSuggestedRuleDraft = suggestion => ({
   keyword: suggestion?.keyword || suggestion?.merchant || "",
@@ -188,6 +224,9 @@ const runClassifyTask = (config, taskId) =>
 
 const confirmSuggestedRules = (config, payload) =>
   syncFetch(config, "/api/kakeibo/suggested-rules/confirm", { method:"POST", body:JSON.stringify(payload) });
+
+const fetchPendingSuggestedRules = config =>
+  syncFetch(config, "/api/kakeibo/suggested-rules?status=pending");
 
 const applyCloudRules = (config, payload = {}) =>
   syncFetch(config, "/api/kakeibo/rules/apply", { method:"POST", body:JSON.stringify(payload) });
@@ -641,18 +680,25 @@ const Range = ({ value, onChange, min, max, step }) => (
     style={{accentColor:"var(--accent)",background:"var(--border)"}} />
 );
 
-const CatPicker = ({ main, sub, onMainChange, onSubChange }) => (
-  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-    <div>
-      <Select value={main} onChange={v => { onMainChange(v); onSubChange("") }}
-        placeholder="大类" options={CAT_KEYS.map(k => ({v:k, l:CATS[k].icon+" "+CATS[k].name}))} />
+const CatPicker = ({ categories = defaultCategories(), main, sub, onMainChange, onSubChange }) => {
+  const enabledCats = _.orderBy(categories.filter(c => !c.deletedAt && c.enabled !== false), ["sort", "name"], ["asc", "asc"]);
+  const current = categories.find(c => c.key === main) || DEFAULT_CAT_MAP[main];
+  const mainOptions = enabledCats.map(c => ({ v:c.key, l:`${c.icon || ""} ${c.name || c.key}`.trim() }));
+  if (main && !mainOptions.some(o => o.v === main)) mainOptions.push({ v:main, l:`${current?.icon || ""} ${current?.name || main}`.trim() });
+  const subOptions = [...(current?.subs || [])];
+  if (sub && !subOptions.includes(sub)) subOptions.push(sub);
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+      <div>
+        <Select value={main} onChange={v => { onMainChange(v); onSubChange("") }}
+          placeholder="大类" options={mainOptions} />
+      </div>
+      <div>
+        <Select value={sub} onChange={onSubChange} placeholder="子类" options={subOptions} />
+      </div>
     </div>
-    <div>
-      <Select value={sub} onChange={onSubChange} placeholder="子类"
-        options={main && CATS[main] ? CATS[main].subs : []} />
-    </div>
-  </div>
-);
+  );
+};
 
 /* ═══════════════════════════════════════════
    6. MAIN APP
@@ -667,6 +713,7 @@ export default function App() {
   });
   const [txns, setTxns] = useState([]);
   const [rules, setRules] = useState([]);
+  const [categories, setCategories] = useState(defaultCategories);
   const [loaded, setLoaded] = useState(false);
   const [themeColor, setThemeColor] = useState("#d4736b");
   const [bgUrl, setBgUrl] = useState("");
@@ -719,6 +766,8 @@ export default function App() {
       const cache = await loadLocalCache();
       if (cache.transactions) setTxns(cache.transactions.map(normalizeTxnSettlement));
       if (cache.rules) setRules(cache.rules.map(normalizeRule));
+      if (Array.isArray(cache.categories) && cache.categories.length) setCategories(cache.categories.map(normalizeCategory));
+      else setCategories(defaultCategories());
       const dm = cache.settings.darkMode;
       if (dm) setDarkMode(dm);
       else {
@@ -768,6 +817,7 @@ export default function App() {
   // Save
   useEffect(() => { if (loaded) db.set("txns", txns) }, [txns, loaded]);
   useEffect(() => { if (loaded) db.set("rules", rules) }, [rules, loaded]);
+  useEffect(() => { if (loaded) db.set("categories", categories) }, [categories, loaded]);
   useEffect(() => { if (loaded) db.set("darkMode", darkMode) }, [darkMode, loaded]);
   useEffect(() => { if (loaded) db.set("themeColor", themeColor) }, [themeColor, loaded]);
   useEffect(() => { if (loaded) db.set("bgUrl", bgUrl) }, [bgUrl, loaded]);
@@ -783,14 +833,17 @@ export default function App() {
   useEffect(() => { if (loaded) db.set("suggestedRules", suggestedRules) }, [suggestedRules, loaded]);
 
   // Computed
+  const catMap = useMemo(() => Object.fromEntries(categories.map(c => [c.key, c])), [categories]);
+  const catKeys = useMemo(() => _.orderBy(categories.filter(c => !c.deletedAt && c.enabled !== false), ["sort", "name"], ["asc", "asc"]).map(c => c.key), [categories]);
+  const suggestedRuleCount = classifySummary?.pendingSuggestedRuleCount ?? suggestedRules.length;
   const activeRules = useMemo(() => rules.filter(r => !r.deletedAt), [rules]);
   const monthTxns = useMemo(() => txns.filter(t => !t.deletedAt && getMonth(t.date) === month), [txns, month]);
   const statsTxns = useMemo(() => monthTxns.filter(t => !t.excludedFromStats && statAmount(t) > 0), [monthTxns]);
   const prevMonth = shiftMonth(month, -1);
   const prevStatsTxns = useMemo(() => txns.filter(t => !t.deletedAt && getMonth(t.date) === prevMonth && !t.excludedFromStats && statAmount(t) > 0), [txns, prevMonth]);
   const pendingSyncCount = useMemo(() =>
-    txns.filter(t => t.pendingSync).length + rules.filter(r => r.pendingSync).length + (settingsPendingSync ? 1 : 0)
-  , [txns, rules, settingsPendingSync]);
+    txns.filter(t => t.pendingSync).length + rules.filter(r => r.pendingSync).length + categories.filter(c => c.pendingSync).length + (settingsPendingSync ? 1 : 0)
+  , [txns, rules, categories, settingsPendingSync]);
   
   const totalSpend = useMemo(() => _.sumBy(statsTxns, statAmount), [statsTxns]);
   const prevTotal = useMemo(() => _.sumBy(prevStatsTxns, statAmount), [prevStatsTxns]);
@@ -802,10 +855,11 @@ export default function App() {
 
   const catData = useMemo(() => {
     const grouped = _.groupBy(statsTxns.filter(t=>t.categoryMain), "categoryMain");
-    return CAT_KEYS.map(k => ({
-      key: k, name: CATS[k].icon+" "+CATS[k].name, value: _.sumBy(grouped[k]||[], statAmount), color: CATS[k].color, count: (grouped[k]||[]).length
+    const keys = _.uniq([...catKeys, ...Object.keys(grouped)]);
+    return keys.map(k => ({
+      key: k, name: (catMap[k]?.icon ? catMap[k].icon+" " : "") + (catMap[k]?.name || k), value: _.sumBy(grouped[k]||[], statAmount), color: catMap[k]?.color || "#999", count: (grouped[k]||[]).length
     })).filter(d => d.value > 0).sort((a,b) => b.value - a.value);
-  }, [statsTxns]);
+  }, [statsTxns, catKeys, catMap]);
 
   const pmData = useMemo(() => {
     const grouped = _.groupBy(statsTxns, "paymentMethod");
@@ -908,6 +962,7 @@ export default function App() {
       exportedAt: new Date().toISOString(),
       txns,
       rules,
+      categories,
       appearance: { darkMode, themeColor, bgUrl, bgImage, bgBlur, bgOverlay, fontSize },
       assets
     };
@@ -931,6 +986,7 @@ export default function App() {
       await assetDb.sync(payload.assets || source.assets || []);
       setTxns(Array.isArray(source.txns) ? source.txns.map(normalizeTxnSettlement) : []);
       setRules(Array.isArray(source.rules) ? source.rules.map(normalizeRule) : []);
+      setCategories(Array.isArray(source.categories) && source.categories.length ? source.categories.map(normalizeCategory) : defaultCategories());
       const ap = source.appearance || {};
       setDarkMode(ap.darkMode || (ap.dark ? "dark" : "light"));
       setThemeColor(ap.themeColor || "#d4736b");
@@ -970,6 +1026,42 @@ export default function App() {
       setRules(prev => [...prev, markPendingSync(normalizeRule({ ...rule, id: uid(), createdAt:now, updatedAt:now, deletedAt:null, serverVersion:0 }))]);
     }
     setRuleEdit(null);
+  };
+
+  const updateCategory = (key, patch) => {
+    const now = new Date().toISOString();
+    setCategories(prev => prev.map((cat, idx) => cat.key === key
+      ? markPendingSync(normalizeCategory({ ...cat, ...patch, updatedAt:now }, idx))
+      : cat
+    ));
+  };
+
+  const addCategorySub = (key) => {
+    const value = cleanText(prompt("新增子类名称"));
+    if (!value) return;
+    const cat = categories.find(c => c.key === key);
+    if (!cat || cat.subs.includes(value)) return;
+    updateCategory(key, { subs:[...cat.subs, value] });
+  };
+
+  const renameCategorySub = (key, index) => {
+    const cat = categories.find(c => c.key === key);
+    const current = cat?.subs?.[index];
+    if (!cat || !current) return;
+    const value = cleanText(prompt("修改子类名称", current));
+    if (!value) return;
+    const nextSubs = cat.subs.map((s, i) => i === index ? value : s);
+    updateCategory(key, { subs:_.uniq(nextSubs) });
+  };
+
+  const moveCategory = (key, direction) => {
+    const ordered = _.orderBy(categories, ["sort", "name"], ["asc", "asc"]);
+    const idx = ordered.findIndex(c => c.key === key);
+    const swap = idx + direction;
+    if (idx < 0 || swap < 0 || swap >= ordered.length) return;
+    const a = ordered[idx], b = ordered[swap];
+    updateCategory(a.key, { sort:b.sort });
+    updateCategory(b.key, { sort:a.sort });
   };
 
   const applyRulesToHistory = (rule) => {
@@ -1067,14 +1159,16 @@ export default function App() {
           lastPulledAt,
           transactions: txns.filter(t => t.pendingSync),
           rules: rules.filter(r => r.pendingSync),
+          categories: categories.filter(c => c.pendingSync),
           settings: settingsPendingSync ? [markPendingSync(currentSettingsRecord())] : [],
           unknownMerchants: collectUnknownMerchants(txns)
         };
-        if (payload.transactions.length || payload.rules.length || payload.settings.length || payload.unknownMerchants.length) {
+        if (payload.transactions.length || payload.rules.length || payload.categories.length || payload.settings.length || payload.unknownMerchants.length) {
           await pushToVps(config, payload);
           const syncedAt = new Date().toISOString();
           setTxns(prev => prev.map(t => t.pendingSync ? { ...t, pendingSync:false, syncedAt } : t));
           setRules(prev => prev.map(r => r.pendingSync ? { ...r, pendingSync:false, syncedAt } : r));
+          setCategories(prev => prev.map(c => c.pendingSync ? { ...c, pendingSync:false, syncedAt } : c));
           setSettingsPendingSync(false);
         }
       }
@@ -1082,10 +1176,13 @@ export default function App() {
       const pulled = await pullFromVps(config, lastPulledAt);
       const remoteTxns = Array.isArray(pulled.transactions) ? pulled.transactions : [];
       const remoteRules = Array.isArray(pulled.rules) ? pulled.rules : [];
+      const remoteCategories = Array.isArray(pulled.categories) ? pulled.categories : [];
       const deletedTxnIds = new Set(pulled.deletedIds?.transactions || []);
       const deletedRuleIds = new Set(pulled.deletedIds?.rules || []);
+      const deletedCategoryIds = new Set(pulled.deletedIds?.categories || []);
       setTxns(prev => mergeByUpdatedAt(prev, remoteTxns, normalizeTxnSettlement).filter(t => !deletedTxnIds.has(t.id)));
       setRules(prev => mergeByUpdatedAt(prev, remoteRules, normalizeRule).filter(r => !deletedRuleIds.has(r.id)));
+      setCategories(prev => mergeCategories(prev, remoteCategories).filter(c => !deletedCategoryIds.has(c.id)));
       applyRemoteSettings(pulled.settings);
       if (Array.isArray(pulled.suggestedRules)) setSuggestedRules(prev => mergeSuggestedRules(prev, pulled.suggestedRules));
       const serverTime = pulled.serverTime || new Date().toISOString();
@@ -1128,6 +1225,30 @@ export default function App() {
     }
   };
 
+  const loadPendingSuggestedRules = async () => {
+    if (!syncUrl || !syncToken) return [];
+    const result = await fetchPendingSuggestedRules({ url:syncUrl, token:syncToken });
+    const pending = (Array.isArray(result.suggestedRules) ? result.suggestedRules : [])
+      .filter(r => r?.id && !r.deletedAt && r.status !== "accepted" && r.status !== "rejected");
+    setSuggestedRules(pending);
+    await db.set("suggestedRules", pending);
+    return pending;
+  };
+
+  const openSuggestions = async () => {
+    try {
+      setClassifyStatus("syncing");
+      setClassifyError("");
+      await loadPendingSuggestedRules();
+      await loadClassifySummary();
+      setShowSuggestions(true);
+      setClassifyStatus("synced");
+    } catch (e) {
+      setClassifyStatus("error");
+      setClassifyError(e.message || "读取分类建议失败");
+    }
+  };
+
   const startClassifyTask = async () => {
     try {
       setClassifyStatus("syncing");
@@ -1153,7 +1274,7 @@ export default function App() {
       setClassifyError("");
       const task = await fetchClassifyTask({ url:syncUrl, token:syncToken }, classifyTask.id);
       setClassifyTask(task);
-      if (Array.isArray(task.suggestedRules)) setSuggestedRules(task.suggestedRules.filter(r => !r.deletedAt && r.status !== "accepted" && r.status !== "rejected"));
+      await loadPendingSuggestedRules();
       setClassifyStatus(task.status || "idle");
       await loadClassifySummary();
     } catch (e) {
@@ -1190,6 +1311,7 @@ export default function App() {
       await applyCloudRules({ url:syncUrl, token:syncToken }, { force:false });
       await runSync({ pushFirst:false, silent:true });
       await loadClassifySummary();
+      await loadPendingSuggestedRules();
       setClassifyStatus("synced");
     } catch (e) {
       setClassifyStatus("error");
@@ -1223,6 +1345,7 @@ export default function App() {
       const result = await applyCloudRules({ url:syncUrl, token:syncToken }, { force:false });
       await runSync({ pushFirst:false, silent:true });
       await loadClassifySummary();
+      await loadPendingSuggestedRules();
       setClassifyStatus("synced");
       alert(`已回填 ${result.updatedTransactions || 0} 笔交易`);
     } catch (e) {
@@ -1386,7 +1509,7 @@ export default function App() {
               <div className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
                 <div className="flex items-center gap-2 mb-3">
                   <button onClick={()=>setDrillCat(null)} className="text-lg" style={{color:"var(--accent)"}}>‹</button>
-                  <span className="text-sm font-semibold">{CATS[drillCat]?.icon} {CATS[drillCat]?.name} 明细</span>
+                  <span className="text-sm font-semibold">{catMap[drillCat]?.icon} {catMap[drillCat]?.name || drillCat} 明细</span>
                 </div>
                 {(() => {
                   const subs = statsTxns.filter(t=>t.categoryMain===drillCat);
@@ -1405,7 +1528,7 @@ export default function App() {
                             <span className="text-xs" style={{color:"var(--text3)"}}>{d.count}笔</span>
                           </div>
                           <div className="flex items-center gap-3">
-                            <div className="h-1.5 rounded-full" style={{width:Math.max(20,d.value/catTotal*120),background:CATS[drillCat]?.color}} />
+                            <div className="h-1.5 rounded-full" style={{width:Math.max(20,d.value/catTotal*120),background:catMap[drillCat]?.color || "#999"}} />
                             <span className="text-sm font-medium w-20 text-right">{fmtAmt(d.value)}</span>
                           </div>
                         </div>
@@ -1447,11 +1570,11 @@ export default function App() {
             <div className="rounded-2xl p-3 space-y-2" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
               <Input value={fKw} onChange={setFKw} placeholder="搜索商户名或备注…" />
               <div className="flex gap-2">
-                <div className="flex-1"><Select value={fCat} onChange={v=>{setFCat(v);setFSub("")}} placeholder="全部分类" options={CAT_KEYS.map(k=>({v:k,l:CATS[k].icon+" "+CATS[k].name}))} /></div>
+                <div className="flex-1"><Select value={fCat} onChange={v=>{setFCat(v);setFSub("")}} placeholder="全部分类" options={catKeys.map(k=>({v:k,l:(catMap[k]?.icon ? catMap[k].icon+" " : "")+(catMap[k]?.name || k)}))} /></div>
                 <div className="flex-1"><Select value={fPm} onChange={setFPm} placeholder="支付方式" options={PM_LIST} /></div>
               </div>
               <div className="flex gap-2">
-                {fCat && <div className="flex-1"><Select value={fSub} onChange={setFSub} placeholder="全部子类" options={CATS[fCat]?.subs||[]} /></div>}
+                {fCat && <div className="flex-1"><Select value={fSub} onChange={setFSub} placeholder="全部子类" options={catMap[fCat]?.subs||[]} /></div>}
                 <button onClick={()=>setFUncat(!fUncat)} className="rounded-xl px-3 py-1.5 text-xs font-medium"
                   style={{background:fUncat?"var(--accent)":"var(--input)",color:fUncat?"#fff":"var(--text)",border:"1px solid var(--border)"}}>
                   未分类
@@ -1482,7 +1605,7 @@ export default function App() {
                           {t.excludedFromStats && <span className="text-xs" style={{color:"var(--text3)"}}>除外</span>}
                         </div>
                         <div className="flex items-center gap-1.5 mt-0.5">
-                          {t.categoryMain && <Pill small text={CATS[t.categoryMain]?.icon+" "+(t.categorySub||CATS[t.categoryMain]?.name)} color={CATS[t.categoryMain]?.color} />}
+                          {t.categoryMain && <Pill small text={`${catMap[t.categoryMain]?.icon || ""} ${t.categorySub || catMap[t.categoryMain]?.name || t.categoryMain}`.trim()} color={catMap[t.categoryMain]?.color || "#999"} />}
                           {!t.categoryMain && <Pill small text="未分類" color="#999" />}
                           {t.memo && <span className="text-xs truncate" style={{color:"var(--text3)"}}>{highlightText(t.memo, fKw)}</span>}
                         </div>
@@ -1514,7 +1637,7 @@ export default function App() {
               </div>
               <Input value={mMerch} onChange={setMMerch} placeholder="商户名" />
               <Input value={mMemo} onChange={setMMemo} placeholder="备注（可选）" />
-              <CatPicker main={mCatM} sub={mCatS} onMainChange={setMCatM} onSubChange={setMCatS} />
+              <CatPicker categories={categories} main={mCatM} sub={mCatS} onMainChange={setMCatM} onSubChange={setMCatS} />
               <Btn primary onClick={addManual} disabled={!mAmt||!mDate} className="w-full">记一笔 💴</Btn>
             </div>
 
@@ -1594,10 +1717,10 @@ export default function App() {
                 <div>最后同步：{lastSyncAt ? new Date(lastSyncAt).toLocaleString() : "尚未同步"}</div>
                 {syncError && <div style={{color:"#c44"}}>{syncError}</div>}
               </div>
-              {suggestedRules.length > 0 && (
+              {suggestedRuleCount > 0 && (
                 <div className="flex items-center justify-between gap-3 pt-2" style={{borderTop:"1px solid var(--border)"}}>
-                  <div className="text-xs" style={{color:"var(--text3)"}}>有 {suggestedRules.length} 条分类建议待确认</div>
-                  <Btn small onClick={()=>setShowSuggestions(true)}>查看</Btn>
+                  <div className="text-xs" style={{color:"var(--text3)"}}>有 {suggestedRuleCount} 条分类建议待确认</div>
+                  <Btn small onClick={openSuggestions}>查看</Btn>
                 </div>
               )}
             </div>
@@ -1615,7 +1738,7 @@ export default function App() {
                   ["未分类交易", classifySummary?.unclassifiedTransactionCount ?? "—"],
                   ["未知商户", classifySummary?.unknownMerchantCount ?? "—"],
                   ["AA/还款待确认", classifySummary?.pendingSettlementCount ?? "—"],
-                  ["建议待确认", classifySummary?.pendingSuggestedRuleCount ?? suggestedRules.length],
+                  ["建议待确认", suggestedRuleCount],
                 ].map(([label,value]) => (
                   <div key={label} className="rounded-xl px-3 py-2" style={{background:"var(--input)"}}>
                     <div className="text-[10px]" style={{color:"var(--text3)"}}>{label}</div>
@@ -1623,6 +1746,7 @@ export default function App() {
                   </div>
                 ))}
               </div>
+              <div className="text-[11px]" style={{color:"var(--text3)"}}>云端分类统计为全部同步账目，不限当前月份；仪表盘未分类只显示当前月份。</div>
               {classifySummary?.lastTask && (
                 <div className="text-xs" style={{color:"var(--text3)"}}>
                   最近任务：{classifySummary.lastTask.status} · {classifySummary.lastTask.updatedAt ? new Date(classifySummary.lastTask.updatedAt).toLocaleString() : ""}
@@ -1631,7 +1755,7 @@ export default function App() {
               <div className="grid grid-cols-2 gap-2">
                 <Btn primary onClick={startClassifyTask} disabled={!syncUrl || !syncToken || classifyStatus==="syncing"}>生成分类建议</Btn>
                 <Btn onClick={refreshClassifyTask} disabled={!syncUrl || !syncToken || classifyStatus==="syncing"}>刷新任务状态</Btn>
-                <Btn onClick={()=>setShowSuggestions(true)} disabled={!suggestedRules.length}>查看建议</Btn>
+                <Btn onClick={openSuggestions} disabled={!syncUrl || !syncToken || classifyStatus==="syncing" || !suggestedRuleCount}>查看建议</Btn>
                 <Btn onClick={applyRulesToCloudHistory} disabled={!syncUrl || !syncToken || classifyStatus==="syncing"}>应用到历史</Btn>
               </div>
               {classifyTask?.id && (
@@ -1641,6 +1765,46 @@ export default function App() {
                 </div>
               )}
               {classifyError && <div className="text-xs" style={{color:"#c44"}}>{classifyError}</div>}
+            </div>
+
+            {/* Categories */}
+            <div className="rounded-2xl p-4 space-y-3" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>分类体系</div>
+                <span className="text-xs" style={{color:"var(--text3)"}}>云端同步</span>
+              </div>
+              <div className="space-y-3">
+                {_.orderBy(categories.filter(c => !c.deletedAt), ["sort", "name"], ["asc", "asc"]).map((cat, idx) => (
+                  <div key={cat.key} className="rounded-2xl p-3 space-y-2" style={{background:"var(--input)",border:"1px solid var(--border)",opacity:cat.enabled===false?0.55:1}}>
+                    <div className="grid grid-cols-[56px_1fr_56px] gap-2">
+                      <Input value={cat.icon} onChange={v=>updateCategory(cat.key, { icon:v })} placeholder="emoji" />
+                      <Input value={cat.name} onChange={v=>updateCategory(cat.key, { name:v })} placeholder="大类名" />
+                      <label className="rounded-xl overflow-hidden border flex items-center justify-center" style={{borderColor:"var(--border)",background:"var(--card)"}}>
+                        <input type="color" value={cat.color} onChange={e=>updateCategory(cat.key, { color:e.target.value })} className="w-16 h-12 border-0 p-0 cursor-pointer" />
+                      </label>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {cat.subs.map((sub, subIdx) => (
+                        <button key={`${sub}-${subIdx}`} onClick={()=>renameCategorySub(cat.key, subIdx)}
+                          className="text-xs rounded-full px-2.5 py-1"
+                          style={{background:"var(--card)",border:"1px solid var(--border)",color:"var(--text2)"}}>
+                          {sub}
+                        </button>
+                      ))}
+                      <button onClick={()=>addCategorySub(cat.key)} className="text-xs rounded-full px-2.5 py-1"
+                        style={{background:"rgba(var(--accent-rgb),0.12)",color:"var(--accent)",border:"1px solid rgba(var(--accent-rgb),0.2)"}}>
+                        + 子类
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Btn small onClick={()=>moveCategory(cat.key, -1)} disabled={idx===0}>上移</Btn>
+                      <Btn small onClick={()=>moveCategory(cat.key, 1)} disabled={idx===categories.filter(c=>!c.deletedAt).length-1}>下移</Btn>
+                      <Btn small onClick={()=>updateCategory(cat.key, { enabled:cat.enabled===false })}>{cat.enabled===false ? "启用" : "禁用"}</Btn>
+                      <Btn small disabled>删除</Btn>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
 
             {/* Appearance */}
@@ -1723,7 +1887,7 @@ export default function App() {
                         <span className="text-xs" style={{color:"var(--text3)"}}>{r.matchType==="exact"?"完全一致":"包含"}</span>
                       </div>
                       <div className="text-xs mt-0.5" style={{color:"var(--text2)"}}>
-                        → {r.ruleType === "settlement_person" ? `结算对象 ${r.settlementPerson || r.keyword}` : `${CATS[r.catMain || r.categoryMain]?.icon || ""} ${r.catSub || r.categorySub || CATS[r.catMain || r.categoryMain]?.name || ""}`}
+                        → {r.ruleType === "settlement_person" ? `结算对象 ${r.settlementPerson || r.keyword}` : `${catMap[r.catMain || r.categoryMain]?.icon || ""} ${r.catSub || r.categorySub || catMap[r.catMain || r.categoryMain]?.name || r.catMain || r.categoryMain || ""}`}
                         {r.pmCondition && ` · ${r.pmCondition}限定`}
                         {` · 優先度${r.priority}`}
                       </div>
@@ -1819,7 +1983,7 @@ export default function App() {
 
       {/* Transaction Edit */}
       <Modal open={!!editTxn} onClose={()=>setEditId(null)} title="编辑交易">
-        {editTxn && <TxnEditor txn={editTxn} onSave={(id,patch)=>{updateTxn(id,patch);setEditId(null)}}
+        {editTxn && <TxnEditor txn={editTxn} categories={categories} onSave={(id,patch)=>{updateTxn(id,patch);setEditId(null)}}
           settlementCandidates={settlementCandidates}
           onConfirmSettlement={confirmSettlementMatch}
           onCreateRule={(kw,catM,catS)=>setRuleEdit({keyword:kw,matchType:"contains",catMain:catM,catSub:catS,pmCondition:"",priority:10,enabled:true})}
@@ -1835,6 +1999,7 @@ export default function App() {
               <SuggestedRuleEditor
                 key={s.id}
                 suggestion={s}
+                categories={categories}
                 draft={suggestionDrafts[s.id] || makeSuggestedRuleDraft(s)}
                 onDraftChange={patch => setSuggestionDrafts(prev => ({
                   ...prev,
@@ -1851,7 +2016,7 @@ export default function App() {
 
       {/* Rule Edit */}
       <Modal open={!!ruleEdit} onClose={()=>setRuleEdit(null)} title={ruleEdit?.id?"编辑规则":"新建规则"}>
-        {ruleEdit && <RuleEditForm rule={ruleEdit} onSave={saveRule} onCancel={()=>setRuleEdit(null)} />}
+        {ruleEdit && <RuleEditForm rule={ruleEdit} categories={categories} onSave={saveRule} onCancel={()=>setRuleEdit(null)} />}
       </Modal>
     </div>
   );
@@ -1861,8 +2026,9 @@ export default function App() {
    7. EDITOR COMPONENTS
    ═══════════════════════════════════════════ */
 
-function SuggestedRuleEditor({ suggestion, draft, onDraftChange, onAccept, onEditAccept, onReject }) {
+function SuggestedRuleEditor({ suggestion, categories, draft, onDraftChange, onAccept, onEditAccept, onReject }) {
   if (!suggestion?.id) return null;
+  const localCatMap = Object.fromEntries((categories || defaultCategories()).map(c => [c.key, c]));
   const current = draft || makeSuggestedRuleDraft(suggestion);
   const {
     keyword, matchType, ruleType, categoryMain, categorySub,
@@ -1892,7 +2058,7 @@ function SuggestedRuleEditor({ suggestion, draft, onDraftChange, onAccept, onEdi
               ? `结算对象 · ${settlementPerson || keyword}`
               : ruleType === "exclude"
                 ? "排除统计"
-                : `${CATS[categoryMain]?.name || categoryMain || "未指定"}${categorySub ? " · "+categorySub : ""}`}
+                : `${localCatMap[categoryMain]?.name || categoryMain || "未指定"}${categorySub ? " · "+categorySub : ""}`}
           </div>
         </div>
         <span className="text-xs shrink-0" style={{color:"var(--accent)"}}>{confidence}%</span>
@@ -1912,7 +2078,8 @@ function SuggestedRuleEditor({ suggestion, draft, onDraftChange, onAccept, onEdi
       </div>
 
       {ruleType === "category" && (
-        <CatSelect
+        <CatPicker
+          categories={categories}
           main={categoryMain}
           sub={categorySub}
           onMainChange={value => onDraftChange({ categoryMain:value, categorySub:"" })}
@@ -1939,7 +2106,7 @@ function SuggestedRuleEditor({ suggestion, draft, onDraftChange, onAccept, onEdi
   );
 }
 
-function TxnEditor({ txn, onSave, onCreateRule, onDelete, settlementCandidates = [], onConfirmSettlement }) {
+function TxnEditor({ txn, categories, onSave, onCreateRule, onDelete, settlementCandidates = [], onConfirmSettlement }) {
   const [merchant, setMerchant] = useState(txn.merchant);
   const [memo, setMemo] = useState(txn.memo);
   const [catM, setCatM] = useState(txn.categoryMain);
@@ -1977,7 +2144,7 @@ function TxnEditor({ txn, onSave, onCreateRule, onDelete, settlementCandidates =
       </div>
       <Input value={merchant} onChange={setMerchant} placeholder="商户名" />
       <Input value={memo} onChange={setMemo} placeholder="备注" />
-      <CatPicker main={catM} sub={catS} onMainChange={setCatM} onSubChange={setCatS} />
+      <CatPicker categories={categories} main={catM} sub={catS} onMainChange={setCatM} onSubChange={setCatS} />
       <Select value={pm} onChange={setPm} placeholder="支付方式" options={PM_LIST} />
       <div className="rounded-xl p-3 space-y-2" style={{background:"var(--input)",border:"1px solid var(--border)"}}>
         <div className="grid grid-cols-3 gap-2 text-center">
@@ -2041,7 +2208,7 @@ function TxnEditor({ txn, onSave, onCreateRule, onDelete, settlementCandidates =
   );
 }
 
-function RuleEditForm({ rule, onSave, onCancel }) {
+function RuleEditForm({ rule, categories, onSave, onCancel }) {
   const [kw, setKw] = useState(rule.keyword);
   const [mt, setMt] = useState(rule.matchType||"contains");
   const [catM, setCatM] = useState(rule.catMain);
@@ -2054,7 +2221,7 @@ function RuleEditForm({ rule, onSave, onCancel }) {
     <div className="space-y-3">
       <Input value={kw} onChange={setKw} placeholder="匹配关键词" />
       <Select value={mt} onChange={setMt} options={[{v:"contains",l:"包含匹配"},{v:"exact",l:"完全一致"}]} />
-      <CatPicker main={catM} sub={catS} onMainChange={setCatM} onSubChange={setCatS} />
+      <CatPicker categories={categories} main={catM} sub={catS} onMainChange={setCatM} onSubChange={setCatS} />
       <Select value={pmC} onChange={setPmC} placeholder="不限支付方式" options={PM_LIST} />
       <div className="flex items-center gap-2">
         <span className="text-sm shrink-0">优先级</span>

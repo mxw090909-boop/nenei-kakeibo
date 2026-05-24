@@ -60,6 +60,14 @@ def init_db() -> None:
       deletedAt TEXT,
       serverVersion INTEGER NOT NULL DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS categories (
+      id TEXT PRIMARY KEY,
+      payload TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      deletedAt TEXT,
+      serverVersion INTEGER NOT NULL DEFAULT 1
+    );
     CREATE TABLE IF NOT EXISTS import_batches (
       id TEXT PRIMARY KEY,
       payload TEXT NOT NULL,
@@ -142,6 +150,7 @@ def pull():
     with db() as conn:
         transactions = read_changed(conn, "transactions", since, include_deleted=False)
         rules = read_changed(conn, "rules", since, include_deleted=False)
+        categories = read_changed(conn, "categories", since, include_deleted=False)
         settings = read_changed(conn, "settings", since, include_deleted=False)
         deleted_ids = read_deleted(conn, since)
         suggested_rules = read_changed(conn, "suggested_rules", since, include_deleted=False)
@@ -150,6 +159,7 @@ def pull():
         "serverTime": now_iso(),
         "transactions": transactions,
         "rules": rules,
+        "categories": categories,
         "settings": settings,
         "deletedIds": deleted_ids,
         "rulesVersion": rules_version,
@@ -167,6 +177,7 @@ def push():
         accepted = {
             "transactions": upsert_many(conn, "transactions", payload.get("transactions", []), server_time),
             "rules": upsert_many(conn, "rules", payload.get("rules", []), server_time),
+            "categories": upsert_many(conn, "categories", payload.get("categories", []), server_time),
             "settings": upsert_many(conn, "settings", payload.get("settings", []), server_time),
             "unknownMerchants": upsert_unknown_merchants(conn, payload.get("unknownMerchants", []), server_time),
         }
@@ -308,6 +319,21 @@ def confirm_suggested_rules():
     return jsonify({"rules": [r for r in rules if r]})
 
 
+@app.route("/api/kakeibo/suggested-rules", methods=["GET", "OPTIONS"])
+def list_suggested_rules():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    status = request.args.get("status", "pending")
+    task_id = request.args.get("taskId", "")
+    with db() as conn:
+        rules = read_all_payloads(conn, "suggested_rules", include_deleted=False)
+    if status:
+        rules = [r for r in rules if r.get("status", "pending") == status]
+    if task_id:
+        rules = [r for r in rules if r.get("taskId") == task_id]
+    return jsonify({"suggestedRules": rules})
+
+
 @app.route("/api/kakeibo/rules/apply", methods=["POST", "OPTIONS"])
 def apply_rules():
     if request.method == "OPTIONS":
@@ -358,7 +384,7 @@ def read_changed(conn: sqlite3.Connection, table: str, since: str, include_delet
 
 def read_deleted(conn: sqlite3.Connection, since: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
-    for table in ("transactions", "rules", "settings"):
+    for table in ("transactions", "rules", "categories", "settings"):
         rows = conn.execute(f"SELECT id FROM {table} WHERE deletedAt IS NOT NULL AND updatedAt > ?", (since or "",)).fetchall()
         out[table] = [row["id"] for row in rows]
     return out
