@@ -38,6 +38,14 @@ const NON_CONSUME_KW = [
 const STORAGE_PREFIX = "nenei-kakeibo:";
 const ASSET_DB_NAME = "nenei-kakeibo-assets";
 const ASSET_STORE = "assets";
+const SYNC_CLIENT_KEY = "syncClientId";
+const SYNC_STATUS = {
+  idle: "未配置",
+  synced: "已同步",
+  pending: "待同步",
+  syncing: "同步中",
+  error: "同步失败"
+};
 
 const createStorage = () => {
   const hasWS = typeof window !== "undefined" && window.storage;
@@ -68,6 +76,106 @@ const createStorage = () => {
   };
 };
 const db = createStorage();
+
+const getSyncClientId = async () => {
+  let clientId = await db.get(SYNC_CLIENT_KEY);
+  if (!clientId) {
+    clientId = `client_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,10)}`;
+    await db.set(SYNC_CLIENT_KEY, clientId);
+  }
+  return clientId;
+};
+
+const apiUrl = (base, path) => `${String(base || "").replace(/\/+$/, "")}${path}`;
+
+const syncFetch = async (config, path, options = {}) => {
+  if (!config?.url || !config?.token) throw new Error("请先填写 VPS API URL 和 Token");
+  const res = await fetch(apiUrl(config.url, path), {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${config.token}`,
+      ...(options.headers || {})
+    }
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+  return res.json();
+};
+
+const loadLocalCache = async () => ({
+  transactions: (await db.get("txns")) || [],
+  rules: (await db.get("rules")) || [],
+  settings: {
+    darkMode: await db.get("darkMode"),
+    themeColor: await db.get("themeColor"),
+    bgUrl: await db.get("bgUrl"),
+    bgImage: await db.get("bgImage"),
+    bgBlur: await db.get("bgBlur"),
+    bgOverlay: await db.get("bgOverlay"),
+    fontSize: await db.get("fontSize"),
+    csvEncoding: await db.get("csvEncoding")
+  },
+  lastPulledAt: await db.get("syncLastPulledAt")
+});
+
+const saveLocalCache = async ({ transactions, rules, settings = {} }) => {
+  if (transactions) await db.set("txns", transactions);
+  if (rules) await db.set("rules", rules);
+  await Promise.all(Object.entries(settings).filter(([,v]) => v !== undefined && v !== null).map(([k,v]) => db.set(k, v)));
+};
+
+const markPendingSync = record => ({
+  ...record,
+  pendingSync: true,
+  updatedAt: record.updatedAt || new Date().toISOString()
+});
+
+const resolveConflict = (local, remote) => {
+  if (!local) return remote;
+  if (!remote) return local;
+  return String(remote.updatedAt || "") > String(local.updatedAt || "") ? remote : local;
+};
+
+const mergeByUpdatedAt = (localItems = [], remoteItems = [], normalizer = x => x) => {
+  const map = new Map();
+  localItems.forEach(item => { if (item?.id) map.set(item.id, item); });
+  remoteItems.forEach(item => {
+    if (!item?.id) return;
+    map.set(item.id, resolveConflict(map.get(item.id), { ...item, pendingSync:false, syncedAt:item.syncedAt || new Date().toISOString() }));
+  });
+  return Array.from(map.values()).filter(item => !item.deletedAt).map(normalizer);
+};
+
+const pullFromVps = (config, since = "") =>
+  syncFetch(config, `/api/kakeibo/sync/pull?since=${encodeURIComponent(since || "")}`);
+
+const pushToVps = (config, payload) =>
+  syncFetch(config, "/api/kakeibo/sync/push", { method:"POST", body:JSON.stringify(payload) });
+
+const collectUnknownMerchants = (transactions = []) => {
+  const grouped = _.groupBy(
+    transactions.filter(t => !t.deletedAt && !t.excludedFromStats && !t.categoryMain && cleanText(t.merchant)),
+    t => `${cleanText(t.merchant)}|${t.paymentMethod || ""}`
+  );
+  return Object.values(grouped).map(items => {
+    const sorted = _.orderBy(items, ["date"], ["asc"]);
+    const first = sorted[0], last = sorted[sorted.length - 1];
+    return {
+      id: `${cleanText(first.merchant).toLowerCase()}|${first.paymentMethod || ""}`,
+      merchant: cleanText(first.merchant),
+      paymentMethod: first.paymentMethod || "",
+      count: items.length,
+      totalAmount: _.sumBy(items, statAmount),
+      firstSeen: first.date,
+      lastSeen: last.date,
+      sampleMemos: _.uniq(items.map(t => cleanText(t.memo)).filter(Boolean)).slice(0, 5),
+      updatedAt: new Date().toISOString()
+    };
+  });
+};
 
 const assetDb = {
   open: () => new Promise((resolve, reject) => {
@@ -253,11 +361,24 @@ const normalizeTxnSettlement = (txn = {}) => {
     originalAmount,
     offsetAmount,
     effectiveAmount,
-    settlementStatus
+    settlementStatus,
+    createdAt: txn.createdAt || new Date().toISOString(),
+    updatedAt: txn.updatedAt || new Date().toISOString(),
+    deletedAt: txn.deletedAt || null,
+    serverVersion: Number(txn.serverVersion || 0)
   };
 };
 
 const statAmount = txn => Math.max(0, Number(txn?.effectiveAmount ?? txn?.amount ?? 0));
+
+const normalizeRule = (rule = {}) => ({
+  ...rule,
+  id: rule.id || uid(),
+  createdAt: rule.createdAt || new Date().toISOString(),
+  updatedAt: rule.updatedAt || new Date().toISOString(),
+  deletedAt: rule.deletedAt || null,
+  serverVersion: Number(rule.serverVersion || 0)
+});
 
 const txnKey = t => `${t.date}|${Number(t.amount)}|${cleanText(t.merchant).toLowerCase()}|${t.paymentMethod}`;
 
@@ -446,8 +567,8 @@ const Select = ({ value, onChange, options, placeholder }) => (
 
 const Input = ({ value, onChange, placeholder, type="text", ...rest }) => (
   <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
-    className="w-full rounded-xl px-3 py-2.5 text-sm outline-none"
-    style={{background:"var(--input)",color:"var(--text)",border:"1px solid var(--border)"}} {...rest} />
+    className="w-full min-w-0 rounded-xl px-3 py-2.5 text-sm outline-none"
+    style={{background:"var(--input)",color:"var(--text)",border:"1px solid var(--border)",boxSizing:"border-box",maxWidth:"100%"}} {...rest} />
 );
 
 const Btn = ({ children, onClick, primary, danger, small, disabled, className="" }) => (
@@ -501,6 +622,14 @@ export default function App() {
   const [bgBlur, setBgBlur] = useState(0);
   const [bgOverlay, setBgOverlay] = useState(0.78);
   const [fontSize, setFontSize] = useState(16);
+  const [syncUrl, setSyncUrl] = useState("");
+  const [syncToken, setSyncToken] = useState("");
+  const [syncStatus, setSyncStatus] = useState("idle");
+  const [syncError, setSyncError] = useState("");
+  const [lastSyncAt, setLastSyncAt] = useState("");
+  const [lastPulledAt, setLastPulledAt] = useState("");
+  const [suggestedRules, setSuggestedRules] = useState([]);
+  const [settingsPendingSync, setSettingsPendingSync] = useState(false);
   
   // Modals
   const [editId, setEditId] = useState(null);
@@ -528,20 +657,27 @@ export default function App() {
   // Load
   useEffect(() => {
     (async () => {
-      const t = await db.get("txns"); if (t) setTxns(t.map(normalizeTxnSettlement));
-      const r = await db.get("rules"); if (r) setRules(r);
-      const dm = await db.get("darkMode");
+      const cache = await loadLocalCache();
+      if (cache.transactions) setTxns(cache.transactions.map(normalizeTxnSettlement));
+      if (cache.rules) setRules(cache.rules.map(normalizeRule));
+      const dm = cache.settings.darkMode;
       if (dm) setDarkMode(dm);
       else {
         const d = await db.get("dark");
         if (d !== null) setDarkMode(d ? "dark" : "light");
       }
-      const tc = await db.get("themeColor"); if (tc) setThemeColor(tc);
-      const bu = await db.get("bgUrl"); if (bu) setBgUrl(bu);
-      const bi = await db.get("bgImage"); if (bi) setBgImage(bi);
-      const bb = await db.get("bgBlur"); if (bb !== null) setBgBlur(bb);
-      const bo = await db.get("bgOverlay"); if (bo !== null) setBgOverlay(bo);
-      const fs = await db.get("fontSize"); if (fs !== null) setFontSize(fs);
+      const tc = cache.settings.themeColor; if (tc) setThemeColor(tc);
+      const bu = cache.settings.bgUrl; if (bu) setBgUrl(bu);
+      const bi = cache.settings.bgImage; if (bi) setBgImage(bi);
+      const bb = cache.settings.bgBlur; if (bb !== null && bb !== undefined) setBgBlur(bb);
+      const bo = cache.settings.bgOverlay; if (bo !== null && bo !== undefined) setBgOverlay(bo);
+      const fs = cache.settings.fontSize; if (fs !== null && fs !== undefined) setFontSize(fs);
+      const ce = cache.settings.csvEncoding; if (ce) setCsvEncoding(ce);
+      const su = await db.get("syncUrl"); if (su) setSyncUrl(su);
+      const st = await db.get("syncToken"); if (st) setSyncToken(st);
+      const lsa = await db.get("syncLastSyncAt"); if (lsa) setLastSyncAt(lsa);
+      if (cache.lastPulledAt) setLastPulledAt(cache.lastPulledAt);
+      const sr = await db.get("suggestedRules"); if (Array.isArray(sr)) setSuggestedRules(sr);
       setLoaded(true);
     })();
   }, []);
@@ -580,12 +716,22 @@ export default function App() {
   useEffect(() => { if (loaded) db.set("bgBlur", bgBlur) }, [bgBlur, loaded]);
   useEffect(() => { if (loaded) db.set("bgOverlay", bgOverlay) }, [bgOverlay, loaded]);
   useEffect(() => { if (loaded) db.set("fontSize", fontSize) }, [fontSize, loaded]);
+  useEffect(() => { if (loaded) db.set("csvEncoding", csvEncoding) }, [csvEncoding, loaded]);
+  useEffect(() => { if (loaded) db.set("syncUrl", syncUrl) }, [syncUrl, loaded]);
+  useEffect(() => { if (loaded) db.set("syncToken", syncToken) }, [syncToken, loaded]);
+  useEffect(() => { if (loaded) db.set("syncLastSyncAt", lastSyncAt) }, [lastSyncAt, loaded]);
+  useEffect(() => { if (loaded) db.set("syncLastPulledAt", lastPulledAt) }, [lastPulledAt, loaded]);
+  useEffect(() => { if (loaded) db.set("suggestedRules", suggestedRules) }, [suggestedRules, loaded]);
 
   // Computed
-  const monthTxns = useMemo(() => txns.filter(t => getMonth(t.date) === month), [txns, month]);
+  const activeRules = useMemo(() => rules.filter(r => !r.deletedAt), [rules]);
+  const monthTxns = useMemo(() => txns.filter(t => !t.deletedAt && getMonth(t.date) === month), [txns, month]);
   const statsTxns = useMemo(() => monthTxns.filter(t => !t.excludedFromStats && statAmount(t) > 0), [monthTxns]);
   const prevMonth = shiftMonth(month, -1);
-  const prevStatsTxns = useMemo(() => txns.filter(t => getMonth(t.date) === prevMonth && !t.excludedFromStats && statAmount(t) > 0), [txns, prevMonth]);
+  const prevStatsTxns = useMemo(() => txns.filter(t => !t.deletedAt && getMonth(t.date) === prevMonth && !t.excludedFromStats && statAmount(t) > 0), [txns, prevMonth]);
+  const pendingSyncCount = useMemo(() =>
+    txns.filter(t => t.pendingSync).length + rules.filter(r => r.pendingSync).length + (settingsPendingSync ? 1 : 0)
+  , [txns, rules, settingsPendingSync]);
   
   const totalSpend = useMemo(() => _.sumBy(statsTxns, statAmount), [statsTxns]);
   const prevTotal = useMemo(() => _.sumBy(prevStatsTxns, statAmount), [prevStatsTxns]);
@@ -626,19 +772,19 @@ export default function App() {
 
   // Actions
   const updateTxn = (id, patch) => {
-    setTxns(prev => prev.map(t => t.id === id ? normalizeTxnSettlement({...t, ...patch, updatedAt: new Date().toISOString()}) : t));
+    setTxns(prev => prev.map(t => t.id === id ? normalizeTxnSettlement(markPendingSync({...t, ...patch, updatedAt: new Date().toISOString()})) : t));
   };
 
   const handleImport = async (file) => {
     try {
       const { text, encoding } = await decodeFile(file, csvEncoding);
       const batchId = uid();
-      const parsed = parseCSV(text, batchId, rules);
+      const parsed = parseCSV(text, batchId, activeRules);
       if (!parsed.txns.length) {
         alert(parsed.errors?.length ? `未能解析交易记录：${parsed.errors[0].message}` : "未能解析任何交易记录");
         return;
       }
-      const dupes = findDuplicates(parsed.txns, txns);
+      const dupes = findDuplicates(parsed.txns, txns.filter(t => !t.deletedAt));
       const dupeKeys = new Set(dupes.map(txnKey));
       const dates = parsed.txns.map(t=>t.date).filter(Boolean).sort();
       setSkipDupes(true);
@@ -664,13 +810,14 @@ export default function App() {
   const confirmImport = () => {
     if (!importPreview) return;
     const importing = skipDupes ? importPreview.txns.filter(t => !t.isDuplicate) : importPreview.txns;
-    setTxns(prev => [...prev, ...importing.map(({isDuplicate, ...t}) => t)]);
+    setTxns(prev => [...prev, ...importing.map(({isDuplicate, ...t}) => markPendingSync(t))]);
     setImportPreview(null);
   };
 
   const undoImport = (batchId) => {
     if (!confirm("确定撤销此次导入？")) return;
-    setTxns(prev => prev.filter(t => t.importBatchId !== batchId));
+    const now = new Date().toISOString();
+    setTxns(prev => prev.map(t => t.importBatchId === batchId ? markPendingSync({...t, deletedAt:now, updatedAt:now}) : t));
   };
 
   const addManual = () => {
@@ -682,7 +829,7 @@ export default function App() {
       source: "manual", importBatchId: "", raw: "",
       type: "expense", excludedFromStats: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
-    Object.assign(txn, normalizeTxnSettlement(txn));
+    Object.assign(txn, normalizeTxnSettlement(markPendingSync(txn)));
     setTxns(prev => [...prev, txn]);
     setMAmt(""); setMMerch(""); setMMemo(""); setMCatM(""); setMCatS("");
   };
@@ -724,7 +871,7 @@ export default function App() {
       if (!confirm("导入备份会覆盖当前账本和外观设置。确定继续？")) return;
       await assetDb.sync(payload.assets || source.assets || []);
       setTxns(Array.isArray(source.txns) ? source.txns.map(normalizeTxnSettlement) : []);
-      setRules(Array.isArray(source.rules) ? source.rules : []);
+      setRules(Array.isArray(source.rules) ? source.rules.map(normalizeRule) : []);
       const ap = source.appearance || {};
       setDarkMode(ap.darkMode || (ap.dark ? "dark" : "light"));
       setThemeColor(ap.themeColor || "#d4736b");
@@ -747,19 +894,21 @@ export default function App() {
       setBgImage(id);
       setBgImageData(dataUrl);
       setBgUrl("");
+      setSettingsPendingSync(true);
     } catch (e) {
       console.error(e);
       alert("背景图保存失败");
     }
   };
 
-  const clearBackground = () => { setBgUrl(""); setBgImage(""); };
+  const clearBackground = () => { setBgUrl(""); setBgImage(""); setSettingsPendingSync(true); };
 
   const saveRule = (rule) => {
+    const now = new Date().toISOString();
     if (rule.id) {
-      setRules(prev => prev.map(r => r.id === rule.id ? rule : r));
+      setRules(prev => prev.map(r => r.id === rule.id ? markPendingSync(normalizeRule({...rule, updatedAt:now})) : r));
     } else {
-      setRules(prev => [...prev, { ...rule, id: uid() }]);
+      setRules(prev => [...prev, markPendingSync(normalizeRule({ ...rule, id: uid(), createdAt:now, updatedAt:now, deletedAt:null, serverVersion:0 }))]);
     }
     setRuleEdit(null);
   };
@@ -772,7 +921,7 @@ export default function App() {
       const match = rule.matchType === "exact" ? txt === kw : txt.includes(kw);
       if (!match) return t;
       if (rule.pmCondition && rule.pmCondition !== t.paymentMethod) return t;
-      return { ...t, categoryMain: rule.catMain, categorySub: rule.catSub, updatedAt: new Date().toISOString() };
+      return normalizeTxnSettlement(markPendingSync({ ...t, categoryMain: rule.catMain, categorySub: rule.catSub, updatedAt: new Date().toISOString() }));
     }));
   };
 
@@ -787,7 +936,7 @@ export default function App() {
         if (t.id === advanceId) {
           const originalAmount = Math.abs(Number(t.originalAmount ?? t.amount ?? 0));
           const offsetAmount = Math.min(originalAmount, Math.max(0, Number(t.offsetAmount || 0)) + repaymentAmount);
-          return normalizeTxnSettlement({
+          return normalizeTxnSettlement(markPendingSync({
             ...t,
             settlementType: "advance",
             originalAmount,
@@ -795,10 +944,10 @@ export default function App() {
             effectiveAmount: Math.max(0, originalAmount - offsetAmount),
             settlementStatus: "matched",
             updatedAt: now
-          });
+          }));
         }
         if (t.id === repaymentId) {
-          return normalizeTxnSettlement({
+          return normalizeTxnSettlement(markPendingSync({
             ...t,
             settlementType: "repayment",
             linkedTransactionId: advanceId,
@@ -806,13 +955,137 @@ export default function App() {
             excludedFromStats: true,
             settlementStatus: "matched",
             updatedAt: now
-          });
+          }));
         }
         return t;
       });
     });
     setEditId(null);
   };
+
+  const currentSettingsRecord = () => ({
+    id: "appearance",
+    darkMode, themeColor, bgUrl, bgImage, bgBlur, bgOverlay, fontSize, csvEncoding,
+    updatedAt: new Date().toISOString(),
+    deletedAt: null,
+    serverVersion: 0
+  });
+
+  const applyRemoteSettings = (settings) => {
+    const list = Array.isArray(settings) ? settings : Object.values(settings || {});
+    const appearance = list.find(s => s?.id === "appearance") || settings?.appearance || null;
+    if (!appearance || appearance.deletedAt) return;
+    if (appearance.darkMode) setDarkMode(appearance.darkMode);
+    if (appearance.themeColor) setThemeColor(appearance.themeColor);
+    setBgUrl(appearance.bgUrl || "");
+    setBgImage(appearance.bgImage || "");
+    if (appearance.bgBlur !== undefined) setBgBlur(Number(appearance.bgBlur || 0));
+    if (appearance.bgOverlay !== undefined) setBgOverlay(Number(appearance.bgOverlay ?? 0.78));
+    if (appearance.fontSize !== undefined) setFontSize(Number(appearance.fontSize || 16));
+    if (appearance.csvEncoding) setCsvEncoding(appearance.csvEncoding);
+    setSettingsPendingSync(false);
+  };
+
+  const markSettingsDirty = (setter) => (value) => {
+    setter(value);
+    if (loaded) setSettingsPendingSync(true);
+  };
+
+  const runSync = async ({ pushFirst = true, silent = false } = {}) => {
+    const config = { url: syncUrl, token: syncToken };
+    if (!config.url || !config.token) {
+      setSyncStatus("idle");
+      if (!silent) setSyncError("请先填写 VPS API URL 和 Token");
+      return;
+    }
+    try {
+      setSyncStatus("syncing");
+      setSyncError("");
+      const clientId = await getSyncClientId();
+      if (pushFirst) {
+        const payload = {
+          clientId,
+          lastPulledAt,
+          transactions: txns.filter(t => t.pendingSync),
+          rules: rules.filter(r => r.pendingSync),
+          settings: settingsPendingSync ? [markPendingSync(currentSettingsRecord())] : [],
+          unknownMerchants: collectUnknownMerchants(txns)
+        };
+        if (payload.transactions.length || payload.rules.length || payload.settings.length || payload.unknownMerchants.length) {
+          await pushToVps(config, payload);
+          const syncedAt = new Date().toISOString();
+          setTxns(prev => prev.map(t => t.pendingSync ? { ...t, pendingSync:false, syncedAt } : t));
+          setRules(prev => prev.map(r => r.pendingSync ? { ...r, pendingSync:false, syncedAt } : r));
+          setSettingsPendingSync(false);
+        }
+      }
+
+      const pulled = await pullFromVps(config, lastPulledAt);
+      const remoteTxns = Array.isArray(pulled.transactions) ? pulled.transactions : [];
+      const remoteRules = Array.isArray(pulled.rules) ? pulled.rules : [];
+      const deletedTxnIds = new Set(pulled.deletedIds?.transactions || []);
+      const deletedRuleIds = new Set(pulled.deletedIds?.rules || []);
+      setTxns(prev => mergeByUpdatedAt(prev, remoteTxns, normalizeTxnSettlement).filter(t => !deletedTxnIds.has(t.id)));
+      setRules(prev => mergeByUpdatedAt(prev, remoteRules, normalizeRule).filter(r => !deletedRuleIds.has(r.id)));
+      applyRemoteSettings(pulled.settings);
+      if (Array.isArray(pulled.suggestedRules)) setSuggestedRules(pulled.suggestedRules.filter(r => !r.deletedAt && r.status !== "accepted"));
+      const serverTime = pulled.serverTime || new Date().toISOString();
+      setLastPulledAt(serverTime);
+      setLastSyncAt(new Date().toISOString());
+      setSyncStatus("synced");
+    } catch (e) {
+      console.error(e);
+      setSyncStatus("error");
+      setSyncError(e.message || "同步失败");
+    }
+  };
+
+  const testSyncConnection = async () => {
+    try {
+      setSyncStatus("syncing");
+      setSyncError("");
+      await pullFromVps({ url: syncUrl, token: syncToken }, "");
+      setSyncStatus("synced");
+      setLastSyncAt(new Date().toISOString());
+    } catch (e) {
+      setSyncStatus("error");
+      setSyncError(e.message || "连接失败");
+    }
+  };
+
+  const acceptSuggestedRule = (suggestion) => {
+    const now = new Date().toISOString();
+    const rule = markPendingSync({
+      id: uid(),
+      keyword: suggestion.keyword || suggestion.merchant || "",
+      matchType: "contains",
+      catMain: suggestion.catMain || suggestion.categoryMain || "",
+      catSub: suggestion.catSub || suggestion.categorySub || "",
+      pmCondition: suggestion.paymentMethod || "",
+      priority: 8,
+      enabled: true,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+      serverVersion: 0,
+      suggestedRuleId: suggestion.id
+    });
+    if (!rule.keyword || !rule.catMain) return;
+    setRules(prev => [...prev, rule]);
+    setSuggestedRules(prev => prev.filter(r => r.id !== suggestion.id));
+  };
+
+  useEffect(() => {
+    if (!loaded || !syncUrl || !syncToken) return;
+    runSync({ pushFirst:false, silent:true });
+  }, [loaded, syncUrl, syncToken]);
+
+  useEffect(() => {
+    if (!loaded || !syncUrl || !syncToken || pendingSyncCount === 0 || syncStatus === "syncing") return;
+    setSyncStatus("pending");
+    const timer = setTimeout(() => runSync({ pushFirst:true, silent:true }), 1200);
+    return () => clearTimeout(timer);
+  }, [loaded, syncUrl, syncToken, pendingSyncCount]);
 
   // CSS Variables
   const dark = darkMode === "dark" || (darkMode === "auto" && systemDark);
@@ -846,11 +1119,11 @@ export default function App() {
   }, [editTxn, txns]);
   
   const recentManual = useMemo(() =>
-    txns.filter(t=>t.source==="manual").sort((a,b)=>b.createdAt.localeCompare(a.createdAt)).slice(0,5)
+    txns.filter(t=>!t.deletedAt && t.source==="manual").sort((a,b)=>b.createdAt.localeCompare(a.createdAt)).slice(0,5)
   , [txns]);
 
   const importBatches = useMemo(() => {
-    const batches = _.groupBy(txns.filter(t=>t.importBatchId), "importBatchId");
+    const batches = _.groupBy(txns.filter(t=>!t.deletedAt && t.importBatchId), "importBatchId");
     return Object.entries(batches).map(([bid, items]) => ({
       id: bid, source: items[0].source, count: items.length,
       date: items[0].createdAt?.slice(0,10), total: _.sumBy(items,"amount")
@@ -875,6 +1148,7 @@ export default function App() {
         .nenei-app .text-lg { font-size: calc(1.125rem * var(--text-scale)) !important; line-height: calc(1.75rem * var(--text-scale)) !important; }
         .nenei-app .text-xl { font-size: calc(1.25rem * var(--text-scale)) !important; line-height: calc(1.75rem * var(--text-scale)) !important; }
         .nenei-app .text-2xl { font-size: calc(1.5rem * var(--text-scale)) !important; line-height: calc(2rem * var(--text-scale)) !important; }
+        .nenei-app input[type="date"] { min-width: 0; max-width: 100%; -webkit-appearance: none; }
       `}</style>
       {hasBg && (
         <>
@@ -1107,16 +1381,6 @@ export default function App() {
         {/* ═══ SETTINGS ═══ */}
         {tab === "settings" && (
           <div className="space-y-4 pt-2">
-            <div className="rounded-2xl overflow-hidden" style={{background:"linear-gradient(135deg, rgba(var(--accent-rgb),0.18), var(--card))",boxShadow:"0 1px 4px rgba(0,0,0,0.06)",border:"1px solid var(--border)"}}>
-              <div className="px-4 py-3 flex items-center justify-between">
-                <div>
-                  <div className="text-sm font-semibold">设置</div>
-                  <div className="text-xs mt-0.5" style={{color:"var(--text2)"}}>数据 · 外观</div>
-                </div>
-                <div className="w-10 h-10 rounded-2xl" style={{background:`linear-gradient(135deg, var(--accent), rgba(var(--accent-rgb),0.28))`}} />
-              </div>
-            </div>
-
             {/* Data */}
             <div className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
               <div className="flex items-center justify-between mb-3">
@@ -1131,7 +1395,7 @@ export default function App() {
                 </div>
               </div>
               <div className="mb-3">
-                <Select value={csvEncoding} onChange={setCsvEncoding} options={[{v:"auto",l:"自动识别编码"},{v:"utf-8",l:"UTF-8"},{v:"shift-jis",l:"Shift_JIS / CP932"}]} />
+                <Select value={csvEncoding} onChange={markSettingsDirty(setCsvEncoding)} options={[{v:"auto",l:"自动识别编码"},{v:"utf-8",l:"UTF-8"},{v:"shift-jis",l:"Shift_JIS / CP932"}]} />
               </div>
               <label className="block rounded-xl border-2 border-dashed p-6 text-center cursor-pointer transition-colors"
                 style={{borderColor:"var(--border)",color:"var(--text3)"}}
@@ -1155,13 +1419,47 @@ export default function App() {
               )}
             </div>
 
+            {/* Cloud Sync */}
+            <div className="rounded-2xl p-4 space-y-3" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>云同步</div>
+                <span className="text-xs px-2 py-1 rounded-full" style={{background:"var(--input)",color:syncStatus==="error"?"#c44":"var(--text2)"}}>
+                  {syncStatus === "pending" ? `待同步 ${pendingSyncCount} 条` : SYNC_STATUS[syncStatus]}
+                </span>
+              </div>
+              <Input value={syncUrl} onChange={setSyncUrl} placeholder="VPS API URL，例如 https://api.example.com" />
+              <Input type="password" value={syncToken} onChange={setSyncToken} placeholder="Token（只保存在本机）" />
+              <div className="grid grid-cols-2 gap-2">
+                <Btn onClick={testSyncConnection} disabled={!syncUrl || !syncToken || syncStatus==="syncing"}>测试连接</Btn>
+                <Btn primary onClick={()=>runSync({pushFirst:true})} disabled={!syncUrl || !syncToken || syncStatus==="syncing"}>立即同步</Btn>
+              </div>
+              <div className="text-xs space-y-1" style={{color:"var(--text3)"}}>
+                <div>最后同步：{lastSyncAt ? new Date(lastSyncAt).toLocaleString() : "尚未同步"}</div>
+                {syncError && <div style={{color:"#c44"}}>{syncError}</div>}
+              </div>
+              {suggestedRules.length > 0 && (
+                <div className="space-y-2 pt-2" style={{borderTop:"1px solid var(--border)"}}>
+                  <div className="text-xs font-medium" style={{color:"var(--text3)"}}>建议分类规则</div>
+                  {suggestedRules.slice(0, 4).map(s => (
+                    <div key={s.id} className="flex items-center justify-between gap-2 text-xs rounded-xl px-3 py-2" style={{background:"var(--input)"}}>
+                      <div className="min-w-0">
+                        <div className="truncate">「{s.keyword || s.merchant}」</div>
+                        <div style={{color:"var(--text3)"}}>{CATS[s.catMain || s.categoryMain]?.name || "未指定"}{s.catSub || s.categorySub ? ` · ${s.catSub || s.categorySub}` : ""}</div>
+                      </div>
+                      <Btn small primary onClick={()=>acceptSuggestedRule(s)}>确认</Btn>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {/* Appearance */}
             <div className="rounded-2xl p-4 space-y-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
               <div className="flex items-center justify-between">
                 <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>外观</div>
                 <div className="flex rounded-xl p-1" style={{background:"var(--input)",border:"1px solid var(--border)"}}>
                   {[["light","浅"],["dark","深"],["auto","自动"]].map(([v,l]) => (
-                    <button key={v} onClick={()=>setDarkMode(v)} className="text-xs px-2.5 py-1 rounded-lg transition-colors"
+                    <button key={v} onClick={()=>markSettingsDirty(setDarkMode)(v)} className="text-xs px-2.5 py-1 rounded-lg transition-colors"
                       style={{background:darkMode===v?"var(--accent)":"transparent",color:darkMode===v?"#fff":"var(--text2)"}}>
                       {l}
                     </button>
@@ -1173,11 +1471,11 @@ export default function App() {
                 <div className="text-xs font-medium mb-2" style={{color:"var(--text3)"}}>主题色</div>
                 <div className="flex items-center gap-2">
                   {THEME_PRESETS.map(c => (
-                    <button key={c} onClick={()=>setThemeColor(c)} className="w-8 h-8 rounded-full transition-transform"
+                    <button key={c} onClick={()=>markSettingsDirty(setThemeColor)(c)} className="w-8 h-8 rounded-full transition-transform"
                       style={{background:c,border:themeColor===c?"3px solid var(--text)":"3px solid transparent",transform:themeColor===c?"scale(1.05)":"none"}} />
                   ))}
                   <label className="w-8 h-8 rounded-full overflow-hidden border flex items-center justify-center" style={{borderColor:"var(--border)",background:"var(--input)"}}>
-                    <input type="color" value={themeColor} onChange={e=>setThemeColor(e.target.value)} className="w-10 h-10 border-0 p-0 cursor-pointer" />
+                    <input type="color" value={themeColor} onChange={e=>markSettingsDirty(setThemeColor)(e.target.value)} className="w-10 h-10 border-0 p-0 cursor-pointer" />
                   </label>
                 </div>
               </div>
@@ -1187,7 +1485,7 @@ export default function App() {
                   <div className="text-xs font-medium" style={{color:"var(--text3)"}}>背景图</div>
                   {(bgUrl || bgImage) && <button onClick={clearBackground} className="text-xs" style={{color:"var(--accent)"}}>清除</button>}
                 </div>
-                <Input value={bgUrl} onChange={v=>{setBgUrl(v); if(v) setBgImage("");}} placeholder="图片 URL" />
+                <Input value={bgUrl} onChange={v=>{setBgUrl(v); if(v) setBgImage(""); setSettingsPendingSync(true);}} placeholder="图片 URL" />
                 <div className="mt-2 flex gap-2">
                   <label className="flex-1 rounded-xl px-3 py-2.5 text-sm text-center cursor-pointer"
                     style={{background:"var(--input)",border:"1px solid var(--border)",color:"var(--text)"}}>
@@ -1204,29 +1502,29 @@ export default function App() {
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <div className="flex justify-between text-xs mb-2" style={{color:"var(--text3)"}}><span>模糊</span><span>{bgBlur}px</span></div>
-                  <Range value={bgBlur} onChange={setBgBlur} min={0} max={20} step={1} />
+                  <Range value={bgBlur} onChange={markSettingsDirty(setBgBlur)} min={0} max={20} step={1} />
                 </div>
                 <div>
                   <div className="flex justify-between text-xs mb-2" style={{color:"var(--text3)"}}><span>遮罩</span><span>{Math.round(bgOverlay*100)}%</span></div>
-                  <Range value={bgOverlay} onChange={setBgOverlay} min={0.35} max={0.95} step={0.05} />
+                  <Range value={bgOverlay} onChange={markSettingsDirty(setBgOverlay)} min={0.35} max={0.95} step={0.05} />
                 </div>
               </div>
 
               <div>
                 <div className="flex justify-between text-xs mb-2" style={{color:"var(--text3)"}}><span>字号</span><span>{fontSize}px</span></div>
-                <Range value={fontSize} onChange={setFontSize} min={14} max={19} step={0.5} />
+                <Range value={fontSize} onChange={markSettingsDirty(setFontSize)} min={14} max={19} step={0.5} />
               </div>
             </div>
 
             {/* Rules */}
             <div className="rounded-2xl p-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
               <div className="flex justify-between items-center mb-3">
-                <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>分类规则 ({rules.length})</div>
+                <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>分类规则 ({activeRules.length})</div>
                 <Btn small primary onClick={()=>setRuleEdit({keyword:"",matchType:"contains",catMain:"",catSub:"",pmCondition:"",priority:10,enabled:true})}>新建</Btn>
               </div>
-              {rules.length === 0 && <div className="text-xs py-4 text-center" style={{color:"var(--text3)"}}>暂无规则</div>}
+              {activeRules.length === 0 && <div className="text-xs py-4 text-center" style={{color:"var(--text3)"}}>暂无规则</div>}
               <div className="space-y-2">
-                {_.orderBy(rules,["priority"],["desc"]).map(r => (
+                {_.orderBy(activeRules,["priority"],["desc"]).map(r => (
                   <div key={r.id} className="flex items-center justify-between py-2 px-2 rounded-xl"
                     style={{background:"var(--input)",opacity:r.enabled?1:0.5}}>
                     <div className="min-w-0 flex-1">
@@ -1243,7 +1541,7 @@ export default function App() {
                     <div className="flex gap-1 shrink-0">
                       <button onClick={()=>applyRulesToHistory(r)} className="text-xs px-1.5 py-0.5 rounded" style={{color:"var(--accent)"}}>回溯</button>
                       <button onClick={()=>setRuleEdit(r)} className="text-xs px-1.5 py-0.5 rounded" style={{color:"var(--text2)"}}>编辑</button>
-                      <button onClick={()=>setRules(prev=>prev.filter(x=>x.id!==r.id))} className="text-xs px-1.5 py-0.5 rounded" style={{color:"#c44"}}>删</button>
+                      <button onClick={()=>{const now=new Date().toISOString();setRules(prev=>prev.map(x=>x.id===r.id?markPendingSync({...x,deletedAt:now,updatedAt:now}):x))}} className="text-xs px-1.5 py-0.5 rounded" style={{color:"#c44"}}>删</button>
                     </div>
                   </div>
                 ))}
@@ -1252,7 +1550,7 @@ export default function App() {
 
             {/* Data info */}
             <div className="text-xs text-center py-2" style={{color:"var(--text3)"}}>
-              共 {txns.length} 笔交易 · {rules.length} 条规则
+              共 {txns.filter(t=>!t.deletedAt).length} 笔交易 · {activeRules.length} 条规则
             </div>
           </div>
         )}
@@ -1335,7 +1633,7 @@ export default function App() {
           settlementCandidates={settlementCandidates}
           onConfirmSettlement={confirmSettlementMatch}
           onCreateRule={(kw,catM,catS)=>setRuleEdit({keyword:kw,matchType:"contains",catMain:catM,catSub:catS,pmCondition:"",priority:10,enabled:true})}
-          onDelete={()=>{setTxns(prev=>prev.filter(t=>t.id!==editId));setEditId(null)}} />}
+          onDelete={()=>{const now=new Date().toISOString();setTxns(prev=>prev.map(t=>t.id===editId?markPendingSync({...t,deletedAt:now,updatedAt:now}):t));setEditId(null)}} />}
       </Modal>
 
       {/* Rule Edit */}
