@@ -155,6 +155,24 @@ const pullFromVps = (config, since = "") =>
 const pushToVps = (config, payload) =>
   syncFetch(config, "/api/kakeibo/sync/push", { method:"POST", body:JSON.stringify(payload) });
 
+const fetchClassifySummary = config =>
+  syncFetch(config, "/api/kakeibo/classify/summary");
+
+const createClassifyTask = (config, payload = {}) =>
+  syncFetch(config, "/api/kakeibo/classify-tasks", { method:"POST", body:JSON.stringify(payload) });
+
+const fetchClassifyTask = (config, taskId) =>
+  syncFetch(config, `/api/kakeibo/classify-tasks/${encodeURIComponent(taskId)}`);
+
+const runClassifyTask = (config, taskId) =>
+  syncFetch(config, `/api/kakeibo/classify-tasks/${encodeURIComponent(taskId)}/run`, { method:"POST", body:"{}" });
+
+const confirmSuggestedRules = (config, payload) =>
+  syncFetch(config, "/api/kakeibo/suggested-rules/confirm", { method:"POST", body:JSON.stringify(payload) });
+
+const applyCloudRules = (config, payload = {}) =>
+  syncFetch(config, "/api/kakeibo/rules/apply", { method:"POST", body:JSON.stringify(payload) });
+
 const collectUnknownMerchants = (transactions = []) => {
   const grouped = _.groupBy(
     transactions.filter(t => !t.deletedAt && !t.excludedFromStats && !t.categoryMain && cleanText(t.merchant)),
@@ -630,6 +648,11 @@ export default function App() {
   const [lastPulledAt, setLastPulledAt] = useState("");
   const [suggestedRules, setSuggestedRules] = useState([]);
   const [settingsPendingSync, setSettingsPendingSync] = useState(false);
+  const [classifySummary, setClassifySummary] = useState(null);
+  const [classifyTask, setClassifyTask] = useState(null);
+  const [classifyStatus, setClassifyStatus] = useState("idle");
+  const [classifyError, setClassifyError] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(false);
   
   // Modals
   const [editId, setEditId] = useState(null);
@@ -1054,30 +1077,125 @@ export default function App() {
   };
 
   const acceptSuggestedRule = (suggestion) => {
-    const now = new Date().toISOString();
-    const rule = markPendingSync({
-      id: uid(),
-      keyword: suggestion.keyword || suggestion.merchant || "",
-      matchType: "contains",
-      catMain: suggestion.catMain || suggestion.categoryMain || "",
-      catSub: suggestion.catSub || suggestion.categorySub || "",
-      pmCondition: suggestion.paymentMethod || "",
-      priority: 8,
-      enabled: true,
-      createdAt: now,
-      updatedAt: now,
-      deletedAt: null,
-      serverVersion: 0,
-      suggestedRuleId: suggestion.id
+    confirmCloudSuggestions({ acceptedIds:[suggestion.id], rejectedIds:[], editedRules:[] });
+  };
+
+  const loadClassifySummary = async () => {
+    if (!syncUrl || !syncToken) return;
+    try {
+      setClassifyError("");
+      const summary = await fetchClassifySummary({ url:syncUrl, token:syncToken });
+      setClassifySummary(summary);
+      if (summary.lastTask) setClassifyTask(prev => prev || summary.lastTask);
+    } catch (e) {
+      setClassifyError(e.message || "读取分类概况失败");
+    }
+  };
+
+  const startClassifyTask = async () => {
+    try {
+      setClassifyStatus("syncing");
+      setClassifyError("");
+      await runSync({ pushFirst:true, silent:true });
+      const task = await createClassifyTask({ url:syncUrl, token:syncToken }, { scope:"unclassified", months:[], source:"", limit:200 });
+      setClassifyTask({ id:task.taskId, status:task.status, unknownMerchantCount:task.unknownMerchantCount, pendingSettlementCount:task.pendingSettlementCount });
+      setClassifyStatus("pending");
+      await loadClassifySummary();
+    } catch (e) {
+      setClassifyStatus("error");
+      setClassifyError(e.message || "创建分类任务失败");
+    }
+  };
+
+  const refreshClassifyTask = async () => {
+    if (!classifyTask?.id) {
+      await loadClassifySummary();
+      return;
+    }
+    try {
+      setClassifyStatus("syncing");
+      setClassifyError("");
+      const task = await fetchClassifyTask({ url:syncUrl, token:syncToken }, classifyTask.id);
+      setClassifyTask(task);
+      if (Array.isArray(task.suggestedRules)) setSuggestedRules(task.suggestedRules.filter(r => r.status !== "accepted"));
+      setClassifyStatus(task.status || "idle");
+      await loadClassifySummary();
+    } catch (e) {
+      setClassifyStatus("error");
+      setClassifyError(e.message || "刷新分类任务失败");
+    }
+  };
+
+  const triggerClassifyRun = async () => {
+    if (!classifyTask?.id) return;
+    try {
+      setClassifyStatus("syncing");
+      await runClassifyTask({ url:syncUrl, token:syncToken }, classifyTask.id);
+      setTimeout(refreshClassifyTask, 1000);
+    } catch (e) {
+      setClassifyStatus("error");
+      setClassifyError(e.message || "触发 worker 失败");
+    }
+  };
+
+  const confirmCloudSuggestions = async ({ acceptedIds = [], rejectedIds = [], editedRules = [] }) => {
+    try {
+      setClassifyStatus("syncing");
+      setClassifyError("");
+      const result = await confirmSuggestedRules({ url:syncUrl, token:syncToken }, { acceptedIds, rejectedIds, editedRules });
+      if (Array.isArray(result.rules)) setRules(prev => mergeByUpdatedAt(prev, result.rules, normalizeRule));
+      setSuggestedRules(prev => prev.filter(r => !acceptedIds.includes(r.id) && !rejectedIds.includes(r.id) && !editedRules.some(e => e.suggestedRuleId === r.id)));
+      await applyCloudRules({ url:syncUrl, token:syncToken }, { force:false });
+      await runSync({ pushFirst:false, silent:true });
+      await loadClassifySummary();
+      setClassifyStatus("synced");
+    } catch (e) {
+      setClassifyStatus("error");
+      setClassifyError(e.message || "确认建议失败");
+    }
+  };
+
+  const rejectSuggestedRule = async (suggestion) => {
+    await confirmCloudSuggestions({ acceptedIds:[], rejectedIds:[suggestion.id], editedRules:[] });
+  };
+
+  const editAndAcceptSuggestedRule = async (suggestion) => {
+    const currentMain = suggestion.categoryMain || suggestion.catMain || "";
+    const nextMain = prompt("大类 key（例如 food / transit / daily）", currentMain);
+    if (!nextMain) return;
+    const currentSub = suggestion.categorySub || suggestion.catSub || "";
+    const nextSub = prompt("子类", currentSub);
+    await confirmCloudSuggestions({
+      editedRules:[{
+        suggestedRuleId:suggestion.id,
+        keyword:suggestion.keyword,
+        matchType:suggestion.matchType || "contains",
+        ruleType:suggestion.ruleType || "category",
+        categoryMain:nextMain,
+        categorySub:nextSub || "",
+        priority:suggestion.priority || 50
+      }]
     });
-    if (!rule.keyword || !rule.catMain) return;
-    setRules(prev => [...prev, rule]);
-    setSuggestedRules(prev => prev.filter(r => r.id !== suggestion.id));
+  };
+
+  const applyRulesToCloudHistory = async () => {
+    try {
+      setClassifyStatus("syncing");
+      const result = await applyCloudRules({ url:syncUrl, token:syncToken }, { force:false });
+      await runSync({ pushFirst:false, silent:true });
+      await loadClassifySummary();
+      setClassifyStatus("synced");
+      alert(`已回填 ${result.updatedTransactions || 0} 笔交易`);
+    } catch (e) {
+      setClassifyStatus("error");
+      setClassifyError(e.message || "应用规则失败");
+    }
   };
 
   useEffect(() => {
     if (!loaded || !syncUrl || !syncToken) return;
     runSync({ pushFirst:false, silent:true });
+    loadClassifySummary();
   }, [loaded, syncUrl, syncToken]);
 
   useEffect(() => {
@@ -1453,6 +1571,47 @@ export default function App() {
               )}
             </div>
 
+            {/* Cloud Classification */}
+            <div className="rounded-2xl p-4 space-y-3" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold" style={{color:"var(--text2)"}}>云端分类</div>
+                <span className="text-xs px-2 py-1 rounded-full" style={{background:"var(--input)",color:classifyStatus==="error"?"#c44":"var(--text2)"}}>
+                  {classifyTask?.status || classifyStatus || "idle"}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  ["未分类交易", classifySummary?.unclassifiedTransactionCount ?? "—"],
+                  ["未知商户", classifySummary?.unknownMerchantCount ?? "—"],
+                  ["AA/还款待确认", classifySummary?.pendingSettlementCount ?? "—"],
+                  ["建议待确认", classifySummary?.pendingSuggestedRuleCount ?? suggestedRules.length],
+                ].map(([label,value]) => (
+                  <div key={label} className="rounded-xl px-3 py-2" style={{background:"var(--input)"}}>
+                    <div className="text-[10px]" style={{color:"var(--text3)"}}>{label}</div>
+                    <div className="text-sm font-semibold">{value}</div>
+                  </div>
+                ))}
+              </div>
+              {classifySummary?.lastTask && (
+                <div className="text-xs" style={{color:"var(--text3)"}}>
+                  最近任务：{classifySummary.lastTask.status} · {classifySummary.lastTask.updatedAt ? new Date(classifySummary.lastTask.updatedAt).toLocaleString() : ""}
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2">
+                <Btn primary onClick={startClassifyTask} disabled={!syncUrl || !syncToken || classifyStatus==="syncing"}>生成分类建议</Btn>
+                <Btn onClick={refreshClassifyTask} disabled={!syncUrl || !syncToken || classifyStatus==="syncing"}>刷新任务状态</Btn>
+                <Btn onClick={()=>setShowSuggestions(true)} disabled={!suggestedRules.length}>查看建议</Btn>
+                <Btn onClick={applyRulesToCloudHistory} disabled={!syncUrl || !syncToken || classifyStatus==="syncing"}>应用到历史</Btn>
+              </div>
+              {classifyTask?.id && (
+                <div className="flex items-center justify-between text-xs" style={{color:"var(--text3)"}}>
+                  <span className="truncate">task: {classifyTask.id}</span>
+                  <button onClick={triggerClassifyRun} style={{color:"var(--accent)"}}>手动运行</button>
+                </div>
+              )}
+              {classifyError && <div className="text-xs" style={{color:"#c44"}}>{classifyError}</div>}
+            </div>
+
             {/* Appearance */}
             <div className="rounded-2xl p-4 space-y-4" style={{background:"var(--card)",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
               <div className="flex items-center justify-between">
@@ -1533,7 +1692,7 @@ export default function App() {
                         <span className="text-xs" style={{color:"var(--text3)"}}>{r.matchType==="exact"?"完全一致":"包含"}</span>
                       </div>
                       <div className="text-xs mt-0.5" style={{color:"var(--text2)"}}>
-                        → {CATS[r.catMain]?.icon} {r.catSub||CATS[r.catMain]?.name}
+                        → {r.ruleType === "settlement_person" ? `结算对象 ${r.settlementPerson || r.keyword}` : `${CATS[r.catMain || r.categoryMain]?.icon || ""} ${r.catSub || r.categorySub || CATS[r.catMain || r.categoryMain]?.name || ""}`}
                         {r.pmCondition && ` · ${r.pmCondition}限定`}
                         {` · 優先度${r.priority}`}
                       </div>
@@ -1634,6 +1793,36 @@ export default function App() {
           onConfirmSettlement={confirmSettlementMatch}
           onCreateRule={(kw,catM,catS)=>setRuleEdit({keyword:kw,matchType:"contains",catMain:catM,catSub:catS,pmCondition:"",priority:10,enabled:true})}
           onDelete={()=>{const now=new Date().toISOString();setTxns(prev=>prev.map(t=>t.id===editId?markPendingSync({...t,deletedAt:now,updatedAt:now}):t));setEditId(null)}} />}
+      </Modal>
+
+      {/* Suggested Rules */}
+      <Modal open={showSuggestions} onClose={()=>setShowSuggestions(false)} title="分类建议">
+        <div className="space-y-3">
+          {suggestedRules.length === 0 && <div className="text-sm text-center py-8" style={{color:"var(--text3)"}}>暂无待确认建议</div>}
+          {suggestedRules.map(s => {
+            const main = s.categoryMain || s.catMain || "";
+            const sub = s.categorySub || s.catSub || "";
+            return (
+              <div key={s.id} className="rounded-xl p-3 space-y-2" style={{background:"var(--input)",border:"1px solid var(--border)"}}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold truncate">「{s.keyword || s.merchant}」</div>
+                    <div className="text-xs mt-0.5" style={{color:"var(--text3)"}}>
+                      {s.ruleType === "settlement_person" ? `结算对象 · ${s.settlementPerson || s.keyword}` : `${CATS[main]?.name || main || "未指定"}${sub ? " · "+sub : ""}`}
+                    </div>
+                  </div>
+                  <span className="text-xs shrink-0" style={{color:"var(--accent)"}}>{Math.round(Number(s.confidence || 0) * 100)}%</span>
+                </div>
+                {s.reason && <div className="text-xs" style={{color:"var(--text2)"}}>{s.reason}</div>}
+                <div className="flex gap-2">
+                  <Btn small primary onClick={()=>acceptSuggestedRule(s)}>确认</Btn>
+                  <Btn small onClick={()=>editAndAcceptSuggestedRule(s)}>编辑确认</Btn>
+                  <Btn small danger onClick={()=>rejectSuggestedRule(s)}>拒绝</Btn>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </Modal>
 
       {/* Rule Edit */}

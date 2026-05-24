@@ -14,6 +14,8 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,7 @@ from flask import Flask, jsonify, request
 DB_PATH = Path(os.environ.get("KAKEIBO_DB", "/opt/codex-tg/kakeibo.sqlite3"))
 AUTH_TOKEN = os.environ.get("KAKEIBO_SYNC_TOKEN", "")
 CODEX_CMD = os.environ.get("KAKEIBO_CODEX_CMD", "")
+CLASSIFY_WORKER_CMD = os.environ.get("KAKEIBO_CLASSIFY_WORKER_CMD", "")
 
 app = Flask(__name__)
 
@@ -167,9 +170,176 @@ def push():
             "settings": upsert_many(conn, "settings", payload.get("settings", []), server_time),
             "unknownMerchants": upsert_unknown_merchants(conn, payload.get("unknownMerchants", []), server_time),
         }
-        enqueue_classify_tasks(conn, payload.get("clientId", ""), payload.get("unknownMerchants", []), server_time)
-    maybe_run_codex_classifier()
     return jsonify({"serverTime": server_time, "accepted": accepted})
+
+
+@app.route("/api/kakeibo/classify/summary", methods=["GET", "OPTIONS"])
+def classify_summary():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    with db() as conn:
+        transactions = read_all_payloads(conn, "transactions", include_deleted=False)
+        tasks = read_all_payloads(conn, "classify_tasks", include_deleted=False)
+        suggested = read_all_payloads(conn, "suggested_rules", include_deleted=False)
+        unclassified = [t for t in transactions if is_unclassified_txn(t)]
+        unknown = aggregate_unknown_merchants(transactions)
+        pending_settlements = [t for t in transactions if is_pending_settlement(t)]
+        last_task = sorted(tasks, key=lambda t: t.get("updatedAt", ""), reverse=True)
+    return jsonify({
+        "unclassifiedTransactionCount": len(unclassified),
+        "unknownMerchantCount": len(unknown),
+        "pendingSettlementCount": len(pending_settlements),
+        "pendingSuggestedRuleCount": len([r for r in suggested if r.get("status", "pending") == "pending"]),
+        "lastTask": summarize_task(last_task[0]) if last_task else None,
+    })
+
+
+@app.route("/api/kakeibo/classify-tasks", methods=["POST", "OPTIONS"])
+def create_classify_task():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    payload = request.get_json(force=True, silent=True) or {}
+    limit = int(payload.get("limit") or 200)
+    server_time = now_iso()
+    with db() as conn:
+        transactions = read_all_payloads(conn, "transactions", include_deleted=False)
+        unknown_merchants = aggregate_unknown_merchants(transactions, limit=limit)
+        pending_settlements = aggregate_pending_settlements(transactions, limit=limit)
+        task_id = "task_" + uuid.uuid4().hex
+        task = {
+            "id": task_id,
+            "status": "pending",
+            "scope": payload.get("scope") or "unclassified",
+            "months": payload.get("months") or [],
+            "source": payload.get("source") or "",
+            "limit": limit,
+            "unknownMerchants": unknown_merchants,
+            "pendingSettlements": pending_settlements,
+            "unknownMerchantCount": len(unknown_merchants),
+            "pendingSettlementCount": len(pending_settlements),
+            "error": "",
+            "createdAt": server_time,
+            "updatedAt": server_time,
+            "deletedAt": None,
+            "serverVersion": 1,
+        }
+        upsert_many(conn, "classify_tasks", [task], server_time)
+        upsert_unknown_merchants(conn, unknown_merchants, server_time)
+    maybe_run_classify_worker(task_id)
+    return jsonify({
+        "taskId": task_id,
+        "status": "pending",
+        "unknownMerchantCount": len(unknown_merchants),
+        "pendingSettlementCount": len(pending_settlements),
+    })
+
+
+@app.route("/api/kakeibo/classify-tasks/<task_id>", methods=["GET", "OPTIONS"])
+def get_classify_task(task_id: str):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    with db() as conn:
+        task = get_payload(conn, "classify_tasks", task_id)
+        if not task:
+            return jsonify({"error": "task not found"}), 404
+        suggestions = [
+            r for r in read_all_payloads(conn, "suggested_rules", include_deleted=False)
+            if r.get("taskId") == task_id and r.get("status", "pending") == "pending"
+        ]
+    return jsonify({
+        **summarize_task(task),
+        "error": task.get("error", ""),
+        "unknownMerchantCount": task.get("unknownMerchantCount", len(task.get("unknownMerchants", []))),
+        "pendingSettlementCount": task.get("pendingSettlementCount", len(task.get("pendingSettlements", []))),
+        "suggestedRules": suggestions,
+    })
+
+
+@app.route("/api/kakeibo/classify-tasks/<task_id>/run", methods=["POST", "OPTIONS"])
+def run_classify_task(task_id: str):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    with db() as conn:
+        task = get_payload(conn, "classify_tasks", task_id)
+    if not task:
+        return jsonify({"error": "task not found"}), 404
+    if task.get("status") in ("running", "completed"):
+        return jsonify(summarize_task(task))
+    maybe_run_classify_worker(task_id)
+    return jsonify({**summarize_task(task), "status": "pending"})
+
+
+@app.route("/api/kakeibo/suggested-rules/confirm", methods=["POST", "OPTIONS"])
+def confirm_suggested_rules():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    payload = request.get_json(force=True, silent=True) or {}
+    accepted_ids = set(payload.get("acceptedIds") or [])
+    rejected_ids = set(payload.get("rejectedIds") or [])
+    edited_rules = payload.get("editedRules") or []
+    server_time = now_iso()
+    formal_rules: list[dict[str, Any]] = []
+    with db() as conn:
+        suggestions = {r["id"]: r for r in read_all_payloads(conn, "suggested_rules", include_deleted=False)}
+        for sid in rejected_ids:
+            suggestion = suggestions.get(sid)
+            if suggestion:
+                suggestion["status"] = "rejected"
+                suggestion["updatedAt"] = server_time
+                upsert_many(conn, "suggested_rules", [suggestion], server_time)
+        for sid in accepted_ids:
+            suggestion = suggestions.get(sid)
+            if suggestion:
+                formal_rules.append(rule_from_suggestion(suggestion, server_time))
+                suggestion["status"] = "accepted"
+                suggestion["updatedAt"] = server_time
+                upsert_many(conn, "suggested_rules", [suggestion], server_time)
+        for edited in edited_rules:
+            sid = edited.get("suggestedRuleId")
+            suggestion = suggestions.get(sid, {})
+            merged = {**suggestion, **edited, "id": sid or edited.get("id") or uuid.uuid4().hex}
+            formal_rules.append(rule_from_suggestion(merged, server_time))
+            if sid and sid in suggestions:
+                suggestions[sid]["status"] = "accepted"
+                suggestions[sid]["updatedAt"] = server_time
+                upsert_many(conn, "suggested_rules", [suggestions[sid]], server_time)
+        saved = upsert_many(conn, "rules", formal_rules, server_time)
+        rules = [get_payload(conn, "rules", r["id"]) for r in saved]
+    return jsonify({"rules": [r for r in rules if r]})
+
+
+@app.route("/api/kakeibo/rules/apply", methods=["POST", "OPTIONS"])
+def apply_rules():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    payload = request.get_json(force=True, silent=True) or {}
+    force = bool(payload.get("force"))
+    server_time = now_iso()
+    updated = []
+    applied_rule_ids = set()
+    with db() as conn:
+        rules = sorted(
+            [r for r in read_all_payloads(conn, "rules", include_deleted=False) if r.get("enabled", True)],
+            key=lambda r: int(r.get("priority") or 0),
+            reverse=True,
+        )
+        txns = read_all_payloads(conn, "transactions", include_deleted=False)
+        for txn in txns:
+            if not should_apply_rule_to_txn(txn, force):
+                continue
+            for rule in rules:
+                if not rule_matches_txn(rule, txn):
+                    continue
+                changed = apply_rule_to_txn(txn, rule, force)
+                if changed:
+                    txn["updatedAt"] = server_time
+                    txn["pendingSync"] = False
+                    updated.append(txn)
+                    applied_rule_ids.add(rule["id"])
+                break
+        if updated:
+            upsert_many(conn, "transactions", updated, server_time)
+    return jsonify({"updatedTransactions": len(updated), "appliedRules": len(applied_rule_ids)})
 
 
 @app.route("/api/kakeibo/health", methods=["GET"])
@@ -194,6 +364,17 @@ def read_deleted(conn: sqlite3.Connection, since: str) -> dict[str, list[str]]:
     return out
 
 
+def read_all_payloads(conn: sqlite3.Connection, table: str, include_deleted: bool) -> list[dict[str, Any]]:
+    where = "" if include_deleted else "WHERE deletedAt IS NULL"
+    rows = conn.execute(f"SELECT * FROM {table} {where} ORDER BY updatedAt ASC").fetchall()
+    return [row_to_payload(row) for row in rows]
+
+
+def get_payload(conn: sqlite3.Connection, table: str, record_id: str) -> dict[str, Any] | None:
+    row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
+    return row_to_payload(row) if row else None
+
+
 def row_to_payload(row: sqlite3.Row) -> dict[str, Any]:
     data = json.loads(row["payload"])
     data.update({
@@ -204,6 +385,187 @@ def row_to_payload(row: sqlite3.Row) -> dict[str, Any]:
         "serverVersion": row["serverVersion"],
     })
     return data
+
+
+def clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def is_truthy(value: Any) -> bool:
+    return value is True or str(value).lower() in ("1", "true", "yes")
+
+
+def is_unclassified_txn(txn: dict[str, Any]) -> bool:
+    return (
+        not txn.get("deletedAt")
+        and not clean_text(txn.get("categoryMain"))
+        and not is_truthy(txn.get("excludedFromStats"))
+    )
+
+
+def is_pending_settlement(txn: dict[str, Any]) -> bool:
+    return (
+        not txn.get("deletedAt")
+        and txn.get("settlementType") in ("repayment", "aa_payment")
+        and txn.get("settlementStatus") == "pending"
+    )
+
+
+def normalized_merchant(value: Any) -> str:
+    return clean_text(value).lower()
+
+
+def aggregate_unknown_merchants(transactions: list[dict[str, Any]], limit: int = 200) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for txn in transactions:
+        if not is_unclassified_txn(txn):
+            continue
+        merchant = clean_text(txn.get("merchant"))
+        if not merchant:
+            continue
+        key = "|".join([
+            normalized_merchant(merchant),
+            clean_text(txn.get("paymentMethod")),
+            clean_text(txn.get("source")),
+            clean_text(txn.get("direction")),
+            clean_text(txn.get("type")),
+        ])
+        groups.setdefault(key, []).append(txn)
+    items = [aggregate_txn_group(rows) for rows in groups.values()]
+    items.sort(key=lambda x: (x["count"], x["amountTotal"]), reverse=True)
+    return items[:limit]
+
+
+def aggregate_pending_settlements(transactions: list[dict[str, Any]], limit: int = 200) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for txn in transactions:
+        if not is_pending_settlement(txn):
+            continue
+        merchant = clean_text(txn.get("merchant"))
+        if not merchant:
+            continue
+        key = "|".join([
+            normalized_merchant(merchant),
+            clean_text(txn.get("paymentMethod")),
+            clean_text(txn.get("source")),
+            clean_text(txn.get("direction")),
+            clean_text(txn.get("type")),
+        ])
+        groups.setdefault(key, []).append(txn)
+    items = [aggregate_txn_group(rows) for rows in groups.values()]
+    items.sort(key=lambda x: (x["count"], x["amountTotal"]), reverse=True)
+    return items[:limit]
+
+
+def aggregate_txn_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = sorted(rows, key=lambda r: r.get("date") or "")
+    first = rows[0]
+    amounts = [float(r.get("effectiveAmount") or r.get("amount") or 0) for r in rows]
+    memos = []
+    for row in rows:
+        memo = clean_text(row.get("memo"))
+        if memo and memo not in memos:
+            memos.append(memo)
+    return {
+        "merchant": clean_text(first.get("merchant")),
+        "normalizedMerchant": normalized_merchant(first.get("merchant")),
+        "paymentMethod": clean_text(first.get("paymentMethod")),
+        "source": clean_text(first.get("source")),
+        "directionSamples": sorted({clean_text(r.get("direction")) for r in rows if clean_text(r.get("direction"))}),
+        "typeSamples": sorted({clean_text(r.get("type")) for r in rows if clean_text(r.get("type"))}),
+        "count": len(rows),
+        "amountMin": min(amounts) if amounts else 0,
+        "amountMax": max(amounts) if amounts else 0,
+        "amountTotal": sum(amounts),
+        "firstDate": rows[0].get("date", ""),
+        "lastDate": rows[-1].get("date", ""),
+        "sampleMemos": memos[:5],
+    }
+
+
+def summarize_task(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": task.get("id"),
+        "status": task.get("status", "pending"),
+        "createdAt": task.get("createdAt", ""),
+        "updatedAt": task.get("updatedAt", ""),
+    }
+
+
+def rule_from_suggestion(suggestion: dict[str, Any], server_time: str) -> dict[str, Any]:
+    rule_type = suggestion.get("ruleType") or "category"
+    keyword = suggestion.get("keyword") or suggestion.get("merchant") or ""
+    category_main = suggestion.get("categoryMain") or suggestion.get("catMain") or ""
+    category_sub = suggestion.get("categorySub") or suggestion.get("catSub") or ""
+    rid = suggestion.get("ruleId") or "rule_" + uuid.uuid4().hex
+    return {
+        "id": rid,
+        "keyword": keyword,
+        "matchType": suggestion.get("matchType") or "contains",
+        "ruleType": rule_type,
+        "categoryMain": category_main,
+        "categorySub": category_sub,
+        "catMain": category_main,
+        "catSub": category_sub,
+        "settlementPerson": suggestion.get("settlementPerson") or "",
+        "settlementTypeHint": suggestion.get("settlementTypeHint") or "",
+        "pmCondition": suggestion.get("paymentMethod") or suggestion.get("pmCondition") or "",
+        "priority": int(suggestion.get("priority") or 50),
+        "enabled": True,
+        "source": "cloud_classification",
+        "suggestedRuleId": suggestion.get("id") or suggestion.get("suggestedRuleId") or "",
+        "createdAt": server_time,
+        "updatedAt": server_time,
+        "deletedAt": None,
+        "serverVersion": 0,
+    }
+
+
+def should_apply_rule_to_txn(txn: dict[str, Any], force: bool) -> bool:
+    if txn.get("deletedAt") or is_truthy(txn.get("excludedFromStats")):
+        return False
+    if force:
+        return True
+    return not clean_text(txn.get("categoryMain")) or is_pending_settlement(txn)
+
+
+def rule_matches_txn(rule: dict[str, Any], txn: dict[str, Any]) -> bool:
+    pm_condition = clean_text(rule.get("pmCondition"))
+    if pm_condition and pm_condition != clean_text(txn.get("paymentMethod")):
+        return False
+    keyword = clean_text(rule.get("keyword")).lower()
+    if not keyword:
+        return False
+    haystack = f"{clean_text(txn.get('merchant'))} {clean_text(txn.get('memo'))}".lower()
+    if rule.get("matchType") == "exact":
+        return haystack.strip() == keyword or clean_text(txn.get("merchant")).lower() == keyword
+    return keyword in haystack
+
+
+def apply_rule_to_txn(txn: dict[str, Any], rule: dict[str, Any], force: bool) -> bool:
+    rule_type = rule.get("ruleType") or "category"
+    changed = False
+    if rule_type == "category" and (force or not clean_text(txn.get("categoryMain"))):
+        category_main = rule.get("categoryMain") or rule.get("catMain") or ""
+        if category_main:
+            txn["categoryMain"] = category_main
+            txn["categorySub"] = rule.get("categorySub") or rule.get("catSub") or ""
+            changed = True
+    elif rule_type == "settlement_person":
+        person = rule.get("settlementPerson") or rule.get("keyword") or ""
+        hint = rule.get("settlementTypeHint") or txn.get("settlementType") or ""
+        if person:
+            txn["settlementPerson"] = person
+            changed = True
+        if hint in ("repayment", "aa_payment"):
+            txn["settlementType"] = hint
+            txn["settlementStatus"] = "pending"
+            changed = True
+    elif rule_type == "exclude":
+        txn["excludedFromStats"] = True
+        txn["type"] = "excluded"
+        changed = True
+    return changed
 
 
 def normalize_record(record: dict[str, Any], server_time: str) -> dict[str, Any]:
@@ -289,6 +651,23 @@ def maybe_run_codex_classifier() -> None:
         subprocess.Popen(CODEX_CMD, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as exc:
         app.logger.warning("failed to start classifier: %s", exc)
+
+
+def maybe_run_classify_worker(task_id: str | None = None) -> None:
+    worker = Path(__file__).with_name("kakeibo_classify_worker.py")
+    if CLASSIFY_WORKER_CMD:
+        cmd = CLASSIFY_WORKER_CMD.format(task_id=task_id or "")
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    if not worker.exists():
+        return
+    cmd = [sys.executable, str(worker)]
+    if task_id:
+        cmd.append(task_id)
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        app.logger.warning("failed to start classify worker: %s", exc)
 
 
 init_db()

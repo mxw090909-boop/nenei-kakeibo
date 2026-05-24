@@ -35,6 +35,17 @@ python3 server/kakeibo_sync_api.py
 - `POST /api/kakeibo/sync/push`
 - `GET /api/kakeibo/health`
 
+核心边界：VPS 保存全部账目；Codex 只处理未分类商户、AA/还款待确认对象和用户手动要求重新分类的聚合信息。Codex 只生成 `suggested_rules`，不直接修改交易流水；用户确认后才写入正式 rules，再由 VPS 回填历史未分类交易。
+
+云端分类接口：
+
+- `GET /api/kakeibo/classify/summary`
+- `POST /api/kakeibo/classify-tasks`
+- `GET /api/kakeibo/classify-tasks/:taskId`
+- `POST /api/kakeibo/classify-tasks/:taskId/run`
+- `POST /api/kakeibo/suggested-rules/confirm`
+- `POST /api/kakeibo/rules/apply`
+
 ## 这版修正
 
 - 从单个 TSX 文件整理为完整 Vite React 项目
