@@ -462,6 +462,11 @@ const normalizeTxnSettlement = (txn = {}) => {
 };
 
 const statAmount = txn => Math.max(0, Number(txn?.effectiveAmount ?? txn?.amount ?? 0));
+const isIncomingTxn = txn => txn?.direction === "in" || txn?.type === "refund" || txn?.type === "repayment";
+const displayTxnAmount = txn => {
+  const amount = txn?.excludedFromStats && statAmount(txn) === 0 ? txn.amount : statAmount(txn);
+  return `${isIncomingTxn(txn) ? "+" : "-"}${fmtAmt(amount)}`;
+};
 
 const normalizeRule = (rule = {}) => ({
   ...rule,
@@ -1660,7 +1665,7 @@ export default function App() {
                         </div>
                       </div>
                       <div className="text-right shrink-0">
-                        <div className="text-sm font-semibold">-{fmtAmt(t.excludedFromStats && statAmount(t) === 0 ? t.amount : statAmount(t))}</div>
+                        <div className="text-sm font-semibold" style={{color:isIncomingTxn(t)?"#4a9c6d":"var(--text)"}}>{displayTxnAmount(t)}</div>
                         <div className="text-xs mt-0.5" style={{color:PM_COLORS[t.paymentMethod]||"var(--text3)"}}>{t.paymentMethod}</div>
                         {t.settlementType !== "none" && (
                           <div className="text-[10px] mt-0.5" style={{color:"var(--accent)"}}>{settlementLabel[t.settlementType]}</div>
@@ -2017,7 +2022,7 @@ export default function App() {
                       <div className="truncate">{t.date} · {t.merchant}</div>
                       <div style={{color:"var(--text3)"}}>{t.paymentMethod}{t.categorySub ? ` · ${t.categorySub}` : " · 未分類"}{t.excludedFromStats ? ` · ${t.type}` : ""}</div>
                     </div>
-                    <div className="font-medium shrink-0">{fmtAmt(t.amount)}</div>
+                    <div className="font-medium shrink-0" style={{color:isIncomingTxn(t)?"#4a9c6d":"var(--text)"}}>{displayTxnAmount(t)}</div>
                   </div>
                 ))}
               </div>
@@ -2189,7 +2194,7 @@ function TxnEditor({ txn, categories, onSave, onCreateRule, onDelete, settlement
     <div className="space-y-3">
       <div className="flex justify-between text-xs" style={{color:"var(--text3)"}}>
         <span>{txn.date} · {txn.source}</span>
-        <span className="text-lg font-bold" style={{color:"var(--text)"}}>-{fmtAmt(statAmount(txn))}</span>
+        <span className="text-lg font-bold" style={{color:isIncomingTxn(txn)?"#4a9c6d":"var(--text)"}}>{displayTxnAmount(txn)}</span>
       </div>
       <Input value={merchant} onChange={setMerchant} placeholder="商户名" />
       <Input value={memo} onChange={setMemo} placeholder="备注" />
