@@ -1150,11 +1150,6 @@ export default function App() {
       setSuggestedRules(prev => prev.filter(r => !acceptedIds.includes(r.id) && !rejectedIds.includes(r.id) && !editedRules.some(e => e.suggestedRuleId === r.id)));
       await applyCloudRules({ url:syncUrl, token:syncToken }, { force:false });
       await runSync({ pushFirst:false, silent:true });
-      if (classifyTask?.id) {
-        const task = await fetchClassifyTask({ url:syncUrl, token:syncToken }, classifyTask.id);
-        setClassifyTask(task);
-        if (Array.isArray(task.suggestedRules)) setSuggestedRules(task.suggestedRules.filter(r => !r.deletedAt && r.status !== "accepted" && r.status !== "rejected"));
-      }
       await loadClassifySummary();
       setClassifyStatus("synced");
     } catch (e) {
@@ -1167,21 +1162,18 @@ export default function App() {
     await confirmCloudSuggestions({ acceptedIds:[], rejectedIds:[suggestion.id], editedRules:[] });
   };
 
-  const editAndAcceptSuggestedRule = async (suggestion) => {
-    const currentMain = suggestion.categoryMain || suggestion.catMain || "";
-    const nextMain = prompt("大类 key（例如 food / transit / daily）", currentMain);
-    if (!nextMain) return;
-    const currentSub = suggestion.categorySub || suggestion.catSub || "";
-    const nextSub = prompt("子类", currentSub);
+  const editAndAcceptSuggestedRule = async (suggestion, patch = {}) => {
     await confirmCloudSuggestions({
       editedRules:[{
         suggestedRuleId:suggestion.id,
-        keyword:suggestion.keyword,
-        matchType:suggestion.matchType || "contains",
-        ruleType:suggestion.ruleType || "category",
-        categoryMain:nextMain,
-        categorySub:nextSub || "",
-        priority:suggestion.priority || 50
+        keyword:cleanText(patch.keyword ?? suggestion.keyword ?? suggestion.merchant),
+        matchType:patch.matchType || suggestion.matchType || "contains",
+        ruleType:patch.ruleType || suggestion.ruleType || "category",
+        categoryMain:patch.categoryMain ?? suggestion.categoryMain ?? suggestion.catMain ?? "",
+        categorySub:patch.categorySub ?? suggestion.categorySub ?? suggestion.catSub ?? "",
+        settlementPerson:patch.settlementPerson ?? suggestion.settlementPerson ?? "",
+        settlementTypeHint:patch.settlementTypeHint ?? suggestion.settlementTypeHint ?? "",
+        priority:Number(patch.priority ?? suggestion.priority ?? 50)
       }]
     });
   };
@@ -1564,17 +1556,9 @@ export default function App() {
                 {syncError && <div style={{color:"#c44"}}>{syncError}</div>}
               </div>
               {suggestedRules.length > 0 && (
-                <div className="space-y-2 pt-2" style={{borderTop:"1px solid var(--border)"}}>
-                  <div className="text-xs font-medium" style={{color:"var(--text3)"}}>建议分类规则</div>
-                  {suggestedRules.slice(0, 4).map(s => (
-                    <div key={s.id} className="flex items-center justify-between gap-2 text-xs rounded-xl px-3 py-2" style={{background:"var(--input)"}}>
-                      <div className="min-w-0">
-                        <div className="truncate">「{s.keyword || s.merchant}」</div>
-                        <div style={{color:"var(--text3)"}}>{CATS[s.catMain || s.categoryMain]?.name || "未指定"}{s.catSub || s.categorySub ? ` · ${s.catSub || s.categorySub}` : ""}</div>
-                      </div>
-                      <Btn small primary onClick={()=>acceptSuggestedRule(s)}>确认</Btn>
-                    </div>
-                  ))}
+                <div className="flex items-center justify-between gap-3 pt-2" style={{borderTop:"1px solid var(--border)"}}>
+                  <div className="text-xs" style={{color:"var(--text3)"}}>有 {suggestedRules.length} 条分类建议待确认</div>
+                  <Btn small onClick={()=>setShowSuggestions(true)}>查看</Btn>
                 </div>
               )}
             </div>
@@ -1807,29 +1791,15 @@ export default function App() {
       <Modal open={showSuggestions} onClose={()=>setShowSuggestions(false)} title="分类建议">
         <div className="space-y-3">
           {suggestedRules.length === 0 && <div className="text-sm text-center py-8" style={{color:"var(--text3)"}}>暂无待确认建议</div>}
-          {suggestedRules.map(s => {
-            const main = s.categoryMain || s.catMain || "";
-            const sub = s.categorySub || s.catSub || "";
-            return (
-              <div key={s.id} className="rounded-xl p-3 space-y-2" style={{background:"var(--input)",border:"1px solid var(--border)"}}>
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <div className="text-sm font-semibold truncate">「{s.keyword || s.merchant}」</div>
-                    <div className="text-xs mt-0.5" style={{color:"var(--text3)"}}>
-                      {s.ruleType === "settlement_person" ? `结算对象 · ${s.settlementPerson || s.keyword}` : `${CATS[main]?.name || main || "未指定"}${sub ? " · "+sub : ""}`}
-                    </div>
-                  </div>
-                  <span className="text-xs shrink-0" style={{color:"var(--accent)"}}>{Math.round(Number(s.confidence || 0) * 100)}%</span>
-                </div>
-                {s.reason && <div className="text-xs" style={{color:"var(--text2)"}}>{s.reason}</div>}
-                <div className="flex gap-2">
-                  <Btn small primary onClick={()=>acceptSuggestedRule(s)}>确认</Btn>
-                  <Btn small onClick={()=>editAndAcceptSuggestedRule(s)}>编辑确认</Btn>
-                  <Btn small danger onClick={()=>rejectSuggestedRule(s)}>拒绝</Btn>
-                </div>
-              </div>
-            );
-          })}
+          {suggestedRules.map(s => (
+            <SuggestedRuleEditor
+              key={s.id}
+              suggestion={s}
+              onAccept={acceptSuggestedRule}
+              onEditAccept={editAndAcceptSuggestedRule}
+              onReject={rejectSuggestedRule}
+            />
+          ))}
         </div>
       </Modal>
 
@@ -1844,6 +1814,92 @@ export default function App() {
 /* ═══════════════════════════════════════════
    7. EDITOR COMPONENTS
    ═══════════════════════════════════════════ */
+
+function SuggestedRuleEditor({ suggestion, onAccept, onEditAccept, onReject }) {
+  const initialMain = suggestion.categoryMain || suggestion.catMain || "";
+  const initialSub = suggestion.categorySub || suggestion.catSub || "";
+  const initialRuleType = suggestion.ruleType || "category";
+  const [keyword, setKeyword] = useState(suggestion.keyword || suggestion.merchant || "");
+  const [matchType, setMatchType] = useState(suggestion.matchType || "contains");
+  const [ruleType, setRuleType] = useState(initialRuleType);
+  const [categoryMain, setCategoryMain] = useState(initialMain);
+  const [categorySub, setCategorySub] = useState(initialSub);
+  const [settlementPerson, setSettlementPerson] = useState(suggestion.settlementPerson || suggestion.keyword || "");
+  const [settlementTypeHint, setSettlementTypeHint] = useState(suggestion.settlementTypeHint || "repayment");
+  const [priority, setPriority] = useState(String(suggestion.priority || 50));
+  const confidence = Math.round(Number(suggestion.confidence || 0) * 100);
+  const isDirty =
+    keyword !== (suggestion.keyword || suggestion.merchant || "") ||
+    matchType !== (suggestion.matchType || "contains") ||
+    ruleType !== initialRuleType ||
+    categoryMain !== initialMain ||
+    categorySub !== initialSub ||
+    settlementPerson !== (suggestion.settlementPerson || suggestion.keyword || "") ||
+    settlementTypeHint !== (suggestion.settlementTypeHint || "repayment") ||
+    Number(priority || 0) !== Number(suggestion.priority || 50);
+
+  const accept = () => {
+    if (!isDirty) {
+      onAccept(suggestion);
+      return;
+    }
+    onEditAccept(suggestion, {
+      keyword, matchType, ruleType, categoryMain, categorySub,
+      settlementPerson, settlementTypeHint, priority:Number(priority || 50)
+    });
+  };
+
+  return (
+    <div className="rounded-2xl p-3 space-y-3" style={{background:"var(--input)",border:"1px solid var(--border)"}}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold truncate">「{suggestion.keyword || suggestion.merchant}」</div>
+          <div className="text-xs mt-0.5" style={{color:"var(--text3)"}}>
+            {ruleType === "settlement_person"
+              ? `结算对象 · ${settlementPerson || keyword}`
+              : ruleType === "exclude"
+                ? "排除统计"
+                : `${CATS[categoryMain]?.name || categoryMain || "未指定"}${categorySub ? " · "+categorySub : ""}`}
+          </div>
+        </div>
+        <span className="text-xs shrink-0" style={{color:"var(--accent)"}}>{confidence}%</span>
+      </div>
+
+      {suggestion.reason && <div className="text-xs" style={{color:"var(--text2)"}}>{suggestion.reason}</div>}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <Input value={keyword} onChange={setKeyword} placeholder="关键词" />
+        <Select value={matchType} onChange={setMatchType} options={[{v:"contains",l:"包含匹配"},{v:"exact",l:"完全一致"}]} />
+        <Select value={ruleType} onChange={setRuleType} options={[
+          {v:"category",l:"分类规则"},
+          {v:"settlement_person",l:"AA/还款对象"},
+          {v:"exclude",l:"排除统计"}
+        ]} />
+        <Input type="number" value={priority} onChange={setPriority} placeholder="优先级" />
+      </div>
+
+      {ruleType === "category" && (
+        <CatSelect main={categoryMain} sub={categorySub} onMainChange={setCategoryMain} onSubChange={setCategorySub} />
+      )}
+
+      {ruleType === "settlement_person" && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <Input value={settlementPerson} onChange={setSettlementPerson} placeholder="结算对象名" />
+          <Select value={settlementTypeHint} onChange={setSettlementTypeHint} options={[
+            {v:"repayment",l:"对方还我"},
+            {v:"aa_payment",l:"我付 AA 款"}
+          ]} />
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <Btn small primary onClick={accept}>{isDirty ? "编辑后确认" : "确认"}</Btn>
+        <Btn small onClick={()=>onAccept(suggestion)}>按原建议确认</Btn>
+        <Btn small danger onClick={()=>onReject(suggestion)}>拒绝</Btn>
+      </div>
+    </div>
+  );
+}
 
 function TxnEditor({ txn, onSave, onCreateRule, onDelete, settlementCandidates = [], onConfirmSettlement }) {
   const [merchant, setMerchant] = useState(txn.merchant);
