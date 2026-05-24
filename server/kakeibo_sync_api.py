@@ -108,7 +108,7 @@ def require_auth() -> tuple[dict[str, Any] | None, int | None]:
     if not AUTH_TOKEN:
         return {"error": "KAKEIBO_SYNC_TOKEN is not configured on the VPS"}, 500
     header = request.headers.get("Authorization", "")
-    token = header.removeprefix("Bearer ").strip()
+    token = header[7:].strip() if header.startswith("Bearer ") else header.strip()
     if token != AUTH_TOKEN:
         return {"error": "Unauthorized"}, 401
     return None, None
